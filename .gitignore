@@ -3,3 +3,7 @@ models/__pycache__
 experiments/__pycache__
 Data
 log_fedmia
+attack_logs
+*/launch.json
+**.venv
+**__pycache__**

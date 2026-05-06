@@ -7,3 +7,7 @@ attack_logs
 */launch.json
 **.venv
 **__pycache__**
+
+# Miscellaneous
+BINN-and-LiRA
+fedmia.pdf

@@ -1,4 +1,7 @@
 import os
+import sys
+import json
+import logging
 from utils.args import parser_args
 from utils.datasets import *
 import copy
@@ -19,8 +22,40 @@ import models as models
 
 from opacus import PrivacyEngine
 from experiments.base import Experiment
-from experiments.trainer_private import TrainerPrivate, TesterPrivate
+from experiments.trainer_private import TrainerPrivate, TesterPrivate, classification_loss, is_binary_model
 from experiments.utils import quant
+from utils.federated import fed_avg_state_dicts
+
+
+logger = logging.getLogger(__name__)
+
+
+def configure_logging(log_dir, level_name="INFO"):
+    os.makedirs(log_dir, exist_ok=True)
+    level = getattr(logging, str(level_name).upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        handlers=[
+            logging.FileHandler(os.path.join(log_dir, "training.log")),
+            logging.StreamHandler(sys.stdout),
+        ],
+        force=True,
+    )
+
+
+def build_model(args, num_classes):
+    if args.model_name == "binn":
+        return models.__dict__[args.model_name](
+            num_classes=num_classes,
+            input_size=args.binn_input_size,
+            output_size=args.binn_output_size,
+            hidden_layers=args.binn_hidden_layers,
+            dropout_prob=args.binn_dropout,
+            non_linearity=args.binn_activation,
+            output_last_layers=args.binn_output_last_layers,
+        )
+    return models.__dict__[args.model_name](num_classes=num_classes)
 
 
 class FederatedLearning(Experiment):
@@ -46,30 +81,38 @@ class FederatedLearning(Experiment):
             os.makedirs(self.save_dir)
         self.data_root = args.data_root
  
+        logger.info("Preparing data: dataset=%s, iid=%s, users=%s", self.dataset, self.iid, self.num_users)
         print('==> Preparing data...')
         self.train_set, self.test_set, self.train_set_mia, self.test_set_mia, self.dict_users, self.train_idxs, self.val_idxs = get_data(dataset=self.dataset,
                                                         data_root = self.data_root,
                                                         iid = self.iid,
                                                         num_users = self.num_users,
                                                         data_aug=self.args.data_augment,
-                                                        noniid_beta=self.args.beta
+                                                        noniid_beta=self.args.beta,
+                                                        args=self.args
                                                         )
 
         print(len(self.train_set), len(self.test_set))
-        print(len(self.train_idxs[0]), len(self.train_idxs[1]))
+        if len(self.train_idxs) > 1:
+            print(len(self.train_idxs[0]), len(self.train_idxs[1]))
         if self.args.dataset == 'cifar10':
             self.num_classes = 10
         elif self.args.dataset == 'cifar100':
             self.num_classes = 100
         elif self.args.dataset == 'dermnet':
             self.num_classes = 23
+        elif self.args.dataset == 'binn_synthetic':
+            self.num_classes = self.args.binn_output_size
      
         self.MIA_trainset_dir=[]
         self.MIA_valset_dir=[]
         self.MIA_trainset_dir_cos=[]
         self.MIA_valset_dir_cos=[]
         self.train_idxs_cos=[]
-        self.testset_idx=(50000+np.arange(10000)).astype(int) # The last 10,000 samples are used as the test set
+        if self.args.dataset in ['cifar10', 'cifar100']:
+            self.testset_idx=(50000+np.arange(len(self.test_set_mia))).astype(int)
+        else:
+            self.testset_idx=(len(self.train_set_mia)+np.arange(len(self.test_set_mia))).astype(int)
         # self.testset_idx_cos=(50000+np.arange(1000)).astype(int)
 
         print('==> Preparing model...')
@@ -93,15 +136,30 @@ class FederatedLearning(Experiment):
               
     def construct_model(self):
 
-        model = models.__dict__[self.args.model_name](num_classes=self.num_classes)
+        model = build_model(self.args, self.num_classes)
 
         #model = torch.nn.DataParallel(model)
         self.model = model.to(self.device)
-        
+
         torch.backends.cudnn.benchmark = True
-        print('Total params: %.2f' % (sum(p.numel() for p in model.parameters())))
+        total_params = sum(p.numel() for p in model.parameters())
+        print('Total params: %.2f' % total_params)
+        logger.info(
+            "Constructed model=%s, params=%s, task_type=%s",
+            self.args.model_name,
+            total_params,
+            getattr(model, "task_type", "multiclass"),
+        )
 
     def train(self):
+        args = self.args
+        logger.info(
+            "Starting federated training: epochs=%s, local_ep=%s, batch_size=%s, lr=%s",
+            self.epochs,
+            self.local_ep,
+            self.batch_size,
+            self.lr,
+        )
         # these dataloader would only be used in calculating accuracy and loss
         train_ldr = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, num_workers=2)
         val_ldr = DataLoader(self.test_set, batch_size=self.batch_size , shuffle=False, num_workers=2)
@@ -136,12 +194,14 @@ class FederatedLearning(Experiment):
         fn=file_name+'.log'
         fn=os.path.join(b,fn)
         print("training log saved in:",fn)
+        logger.info("Per-round metric log saved in %s", fn)
 
         lr_0=self.lr
 
         for epoch in range(self.epochs):
 
             global_state_dict=copy.deepcopy(self.model.state_dict())
+            logger.info("Communication round %s/%s started", epoch + 1, self.epochs)
 
             if self.sampling_type == 'uniform':
                 self.m = max(int(self.frac * self.num_users), 1)
@@ -154,7 +214,9 @@ class FederatedLearning(Experiment):
 
                 self.model.load_state_dict(global_state_dict)
 
+                logger.debug("Client %s local update started", idx)
                 local_w, local_loss= self.trainer._local_update_noback(local_train_ldrs[idx], self.local_ep, self.lr, self.optim, args.sampling_proportion)
+                logger.debug("Client %s local update finished: loss=%.6f", idx, local_loss)
                 
                 if args.defense != 'none':
                     model_grads = {}
@@ -195,7 +257,7 @@ class FederatedLearning(Experiment):
                     save_dict['test_acc']=test_acc
                     save_dict['test_loss']=test_loss
                     crossentropy_noreduce = nn.CrossEntropyLoss(reduction='none')
-                    device = torch.device("cuda")
+                    device = self.device
 
                     test_ldr_mia = DataLoader(self.test_set_mia, batch_size=self.batch_size , shuffle=False, num_workers=2)
                     test_res = get_all_losses(test_ldr_mia, self.model, crossentropy_noreduce, device)
@@ -225,6 +287,10 @@ class FederatedLearning(Experiment):
                         data_num = 300
                         needed_test_indexs = None
                         # print('needed_test_indexs:',len(needed_test_indexs))
+                    elif self.args.dataset == 'binn_synthetic':
+                        data_num = max(1, min(len(self.test_set_mia) // self.num_users, len(self.train_idxs[1]) if len(self.train_idxs) > 1 else len(self.train_idxs[0])))
+                        needed_test_indexs = random.sample(list(range(0, len(self.test_set_mia))), data_num)
+                        save_dict['needed_test_index']=needed_test_indexs
                     for c_id in range(1,self.num_users):
                         mixed_indexs.extend(random.sample(list(self.train_idxs[c_id]), data_num))
                     # print('len(mixed_indexs):', len(mixed_indexs))
@@ -244,8 +310,8 @@ class FederatedLearning(Experiment):
                                 model_grads.append(para_diff.detach().cpu().flatten())
                         model_grads=torch.cat(model_grads,-1)
                         ## compute cosine score and grad diff score
-                        cos_model = models.__dict__[self.args.model_name](num_classes=self.num_classes)
-                        cos_model = cos_model.to(torch.device("cuda")) 
+                        cos_model = build_model(self.args, self.num_classes)
+                        cos_model = cos_model.to(self.device)
                         cos_model.load_state_dict(global_state_dict) # Load the basic global model
                         train_cos,train_diffs, train_norm,val_cos, val_diffs,val_norm,test_cos, test_diffs,test_norm, mix_cos, mix_diffs,mix_norm=get_all_cos(cos_model, val_ldr,test_ldr_mia, self.test_set_mia, self.train_set_mia,
                                                                  self.train_idxs[self.watch_train_client_id],
@@ -271,7 +337,9 @@ class FederatedLearning(Experiment):
                     if not os.path.exists(os.path.join(os.getcwd(), self.save_dir)):
                         os.makedirs(os.path.join(os.getcwd(), self.save_dir))
                         print('MIA Score Saved in:', os.path.join(os.getcwd(), self.save_dir))
-                    torch.save(save_dict, os.path.join(os.getcwd(), self.save_dir, f'client_{idx}_losses_epoch{epoch+1}.pkl'))
+                    artifact_path = os.path.join(os.getcwd(), self.save_dir, f'client_{idx}_losses_epoch{epoch+1}.pkl')
+                    torch.save(save_dict, artifact_path)
+                    logger.info("Saved MIA/shadow artifact: %s", artifact_path)
             if self.optim=="sgd":
                 if self.args.lr_up=='common':
                     self.lr = self.lr * 0.99
@@ -283,10 +351,9 @@ class FederatedLearning(Experiment):
             else:
                 pass
 
-            client_weights = []
-            for i in range(self.num_users):
-                client_weight = len(DatasetSplit(self.train_set, self.dict_users[i]))/len(self.train_set)
-                client_weights.append(client_weight)
+            client_sample_counts = [self._client_num_samples(i) for i in idxs_users]
+            sampled_total = max(sum(client_sample_counts), 1)
+            client_weights = [count / sampled_total for count in client_sample_counts]
             
             self._fed_avg(local_ws, client_weights, 1)
             self.model.load_state_dict(self.w_t)
@@ -338,22 +405,22 @@ class FederatedLearning(Experiment):
 
         return self.logs, interval_time, self.logs['best_test_acc'], acc_test_mean
 
+    def _client_num_samples(self, client_id):
+        client_data = self.dict_users[client_id]
+        if isinstance(client_data, (set, list, tuple, np.ndarray)):
+            return len(client_data)
+        return len(client_data)
+
     def _fed_avg(self, local_ws, client_weights, lr_outer):
-
-        w_avg = copy.deepcopy(local_ws[0])
-        for k in w_avg.keys():
-            w_avg[k] = w_avg[k] * client_weights[0]
-
-            for i in range(1, len(local_ws)):
-                w_avg[k] += local_ws[i][k] * client_weights[i]
-
-            self.w_t[k] = w_avg[k]
+        w_avg = fed_avg_state_dicts(local_ws, client_weights)
+        for key, value in w_avg.items():
+            self.w_t[key] = value
 
 
 def get_loss_distributions(idx, MIA_trainset_dir,MIA_testloader, MIA_valset_dir, model):
         """ Obtain the member and nonmember loss distributions"""
         crossentropy_noreduce = nn.CrossEntropyLoss(reduction='none')
-        device = torch.device("cuda")
+        device = next(model.parameters()).device
         train_res = get_all_losses(MIA_trainset_dir[idx], model, crossentropy_noreduce, device)
         test_res = get_all_losses(MIA_testloader, model, crossentropy_noreduce, device)
         val_res = get_all_losses(MIA_valset_dir[idx], model, crossentropy_noreduce, device)
@@ -371,8 +438,8 @@ def get_all_losses(dataloader, model, criterion, device,req_logits=False):
             ### Forward
             outputs = model(inputs)
             ### Evaluate
-            loss = criterion(outputs, targets)
-            losses.append(loss.cpu().numpy())
+            loss = classification_loss(model, outputs, targets, reduction='none') if is_binary_model(model) else criterion(outputs, targets.long())
+            losses.append(loss.detach().cpu().view(-1).numpy())
             logits.append(outputs.cpu())
             labels.append(targets.cpu())
 
@@ -383,7 +450,7 @@ def get_all_losses(dataloader, model, criterion, device,req_logits=False):
 
 def get_all_losses_from_indexes(dataset,indexes, model):
     criterion = nn.CrossEntropyLoss(reduction='none')
-    device = torch.device("cuda")
+    device = next(model.parameters()).device
     dataloader=DataLoader(DatasetSplit(dataset, indexes), batch_size = 200 ,shuffle=False, num_workers=0)
     model.eval()
     losses = []
@@ -395,8 +462,8 @@ def get_all_losses_from_indexes(dataset,indexes, model):
             ### Forward
             outputs = model(inputs)
             ### Evaluate
-            loss = criterion(outputs, targets)
-            losses.append(loss.cpu().numpy())
+            loss = classification_loss(model, outputs, targets, reduction='none') if is_binary_model(model) else criterion(outputs, targets.long())
+            losses.append(loss.detach().cpu().view(-1).numpy())
             logits.append(outputs.cpu())
             labels.append(targets.cpu())
 
@@ -405,8 +472,8 @@ def get_all_losses_from_indexes(dataset,indexes, model):
     labels = torch.cat(labels)
     return {"loss":losses,"logit":logits,"labels":labels}
 
-def get_all_cos(cos_model, initial_loader, test_dataloader, test_set, train_set, train_idxs, val_idxs, mix_idxs, needed_test_indexs, model_grads, lr, optim_choice): 
-    device = torch.device("cuda")
+def get_all_cos(cos_model, initial_loader, test_dataloader, test_set, train_set, train_idxs, val_idxs, mix_idxs, needed_test_indexs, model_grads, lr, optim_choice):
+    device = next(cos_model.parameters()).device
     if optim_choice=="sgd":
         
         optimizer = optim.SGD(cos_model.parameters(),
@@ -418,18 +485,29 @@ def get_all_cos(cos_model, initial_loader, test_dataloader, test_set, train_set,
                             lr,
                             weight_decay=0.0005)
     cos_models=[]
-    privacy_engine = PrivacyEngine()
-    cos_model, optimizer, samples_loader = privacy_engine.make_private(
-        module=cos_model,
-        optimizer=optimizer,
-        data_loader=initial_loader,
-        noise_multiplier=0,
-        max_grad_norm=1e10,
-    )
- 
+    if is_binary_model(cos_model):
+        logger.info("Using manual per-sample gradients for BINN cosine scores.")
+    else:
+        try:
+            privacy_engine = PrivacyEngine()
+            cos_model, optimizer, samples_loader = privacy_engine.make_private(
+                module=cos_model,
+                optimizer=optimizer,
+                data_loader=initial_loader,
+                noise_multiplier=0,
+                max_grad_norm=1e10,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Opacus per-sample gradients unavailable for %s; using manual fallback. Error: %s",
+                cos_model.__class__.__name__,
+                exc,
+            )
+
     tarin_dataloader=DataLoader(DatasetSplit(train_set, train_idxs), batch_size = 10 ,shuffle=False, num_workers=4)
     # val_dataloader=DataLoader(DatasetSplit(train_set, val_idxs), batch_size = 10 ,shuffle=False, num_workers=4)
-    test_dataloader=DataLoader(DatasetSplit(test_set, needed_test_indexs), batch_size=10 , shuffle=False, num_workers=4)
+    if needed_test_indexs is not None:
+        test_dataloader=DataLoader(DatasetSplit(test_set, needed_test_indexs), batch_size=10 , shuffle=False, num_workers=4)
     mix_dataloader=DataLoader(DatasetSplit(train_set, mix_idxs), batch_size = 10 ,shuffle=False, num_workers=4)
     
     train_cos, train_diffs,train_norm=get_cos_score(tarin_dataloader,optimizer,cos_model,device,model_grads)
@@ -441,14 +519,15 @@ def get_all_cos(cos_model, initial_loader, test_dataloader, test_set, train_set,
     return train_cos, train_diffs, train_norm,val_cos,val_diffs,val_norm,test_cos, test_diffs,test_norm, mix_cos, mix_diffs,mix_norm
 
 def get_cos_score(samples_ldr,optimizer,cos_model,device,model_grads ):
-     
-    model_grads=model_grads.to(torch.device("cuda"))
+
+    model_grads=model_grads.to(device)
     cos_model.train()  
     cos_scores=[] 
     grad_diffs=[]    
     sample_grads=[] 
     
     model_diff_norm=torch.norm(model_grads, p=2, dim=0)**2
+    params = [param for param in cos_model.parameters() if param.requires_grad]
     for batch_idx, (x, y) in enumerate(samples_ldr):
         sample_batch_grads=[]
 
@@ -458,16 +537,34 @@ def get_cos_score(samples_ldr,optimizer,cos_model,device,model_grads ):
         loss = torch.tensor(0.).to(device)
 
         pred = cos_model(x)
-        loss += F.cross_entropy(pred, y)
+        loss += classification_loss(cos_model, pred, y)
         loss.backward()
 
         sample_batch_grads=[]
+        has_grad_samples = True
         for name, param in cos_model.named_parameters(): #Save the grads of all parameters of the Model for the samples of the batch.
             if param.requires_grad==True:
+                if not hasattr(param, "grad_sample") or param.grad_sample is None:
+                    has_grad_samples = False
+                    break
                 #The i-th dimension is the grad of the parameter of the i-th sample
                 sample_batch_grads.append(param.grad_sample.flatten(start_dim=1))
 
-        sample_batch_grads=torch.cat(sample_batch_grads,1) # For each sample, concatenate its grads for all parameters into one line
+        if has_grad_samples:
+            sample_batch_grads=torch.cat(sample_batch_grads,1) # For each sample, concatenate its grads for all parameters into one line
+        else:
+            manual_grads = []
+            for sample_idx in range(x.size(0)):
+                cos_model.zero_grad()
+                pred_i = cos_model(x[sample_idx:sample_idx + 1])
+                loss_i = classification_loss(cos_model, pred_i, y[sample_idx:sample_idx + 1])
+                grads = torch.autograd.grad(loss_i, params, retain_graph=False, allow_unused=True)
+                flat_grads = [
+                    torch.zeros_like(param).flatten() if grad is None else grad.flatten()
+                    for grad, param in zip(grads, params)
+                ]
+                manual_grads.append(torch.cat(flat_grads))
+            sample_batch_grads = torch.stack(manual_grads, dim=0)
 
         for sample_grad in sample_batch_grads:
             cos_score = F.cosine_similarity(sample_grad, model_grads, dim=0)
@@ -532,4 +629,6 @@ if __name__ == '__main__':
     args.save_dir=args.save_dir+'/'+f"{args.dataset}_K{args.num_users}_N{args.samples_per_user}_{args.model_name}_def{args.defense}_iid${args.iid}_${args.beta}_${args.optim}_local{args.local_ep}_s{args.seed}"
     print("scores saved in:",os.path.join(os.getcwd(), args.save_dir))
     args.log_folder_name=args.save_dir
+    configure_logging(args.save_dir, args.log_level)
+    logger.info("Arguments: %s", args)
     main(args)

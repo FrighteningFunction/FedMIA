@@ -22,7 +22,7 @@ class Experiment(object):
         self.val_loader = None
         self.buffer = []
         self.save_history_interval = 1
-        self.device = torch.device('cuda')
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         root =  os.getcwd()
         self.num_users = args.num_users
@@ -37,6 +37,8 @@ class Experiment(object):
             self.num_classes = 10
         if args.dataset == 'cifar100':
             self.num_classes = 100
+        if args.dataset == 'binn_synthetic':
+            self.num_classes = getattr(args, 'binn_output_size', 1)
         ## federated learning args
         self.frac = args.frac
         self.data_root = args.data_root
@@ -115,4 +117,3 @@ class Experiment(object):
         self.buffer.append(data)
         if len(self.buffer) >= self.save_history_interval:
             self.flush_history(history_file, first)
-    

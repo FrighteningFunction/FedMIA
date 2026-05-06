@@ -66,8 +66,26 @@ def parser_args():
                         help='cosine_attack')
     
     # ============================ Model arguments ===================================
-    parser.add_argument('--model_name', type=str, default='alexnet', choices=['alexnet','ResNet18'],
+    parser.add_argument('--model_name', type=str, default='alexnet', choices=['alexnet','ResNet18','binn'],
                         help='model architecture name')
+    parser.add_argument('--binn_input_size', type=int, default=128,
+                        help='number of input gene/features for BINN')
+    parser.add_argument('--binn_hidden_layers', type=str, default='128,64,32',
+                        help='comma-separated BINN hidden layer widths')
+    parser.add_argument('--binn_output_size', type=int, default=1,
+                        help='BINN output size; 1 means binary BCEWithLogits training')
+    parser.add_argument('--binn_dropout', type=float, default=0.2,
+                        help='dropout probability for BINN hidden activations')
+    parser.add_argument('--binn_activation', type=str, default='relu',
+                        help='BINN hidden activation')
+    parser.add_argument('--binn_output_last_layers', type=int, default=1,
+                        help='number of final BINN layers used by residual readout')
+    parser.add_argument('--binn_synthetic_samples', type=int, default=2000,
+                        help='number of generated BINN training samples')
+    parser.add_argument('--binn_synthetic_test_samples', type=int, default=500,
+                        help='number of generated BINN test samples')
+    parser.add_argument('--binn_synthetic_signal', type=float, default=2.0,
+                        help='signal strength for generated BINN labels')
     
     parser.add_argument('--dataset', type=str, default='cifar100', help="name of dataset")
     
@@ -80,6 +98,8 @@ def parser_args():
     parser.add_argument('--bp_interval', default=30, type=int, help='interval for starting bp the local part')
     parser.add_argument('--log_interval', default=1, type=int,
                         help='interval for evaluating loss and accuracy')
+    parser.add_argument('--log_level', default='INFO', type=str,
+                        help='logging level: DEBUG, INFO, WARNING, ERROR')
     parser.add_argument('--exp-id', type=int, default=1,
                         help='experiment id')
     parser.add_argument("--sigma_sgd",

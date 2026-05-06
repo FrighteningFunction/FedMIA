@@ -1,6 +1,7 @@
 import time
 import os
 import copy
+import logging
 from unittest import result
 import torch
 from torch import tensor
@@ -18,6 +19,28 @@ from experiments.defense_instahide import  defense_insta
 
 import time
 import random
+
+
+logger = logging.getLogger(__name__)
+
+
+def is_binary_model(model):
+    base_model = getattr(model, "_module", model)
+    return getattr(base_model, "task_type", None) == "binary"
+
+
+def classification_loss(model, pred, target, reduction="mean"):
+    if is_binary_model(model):
+        target = target.float().view_as(pred)
+        return F.binary_cross_entropy_with_logits(pred, target, reduction=reduction)
+    return F.cross_entropy(pred, target.long(), reduction=reduction)
+
+
+def classification_accuracy(model, pred, target):
+    if is_binary_model(model):
+        predicted = (torch.sigmoid(pred).view_as(target.float()) >= 0.5).to(target.dtype)
+        return predicted.eq(target).float().mean().mul(100.0)
+    return accuracy(pred, target.long())[0]
 
 
 def accuracy(output, target, topk=(1,)):
@@ -139,7 +162,7 @@ class TrainerPrivate(object):
         # print('lam:',lam)
         batch_size = x.size()[0]
         if use_cuda:
-            index = torch.randperm(batch_size).cuda()
+            index = torch.randperm(batch_size, device=x.device)
         else:
             index = torch.randperm(batch_size)
 
@@ -154,6 +177,14 @@ class TrainerPrivate(object):
         return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
     
     def _local_update_noback(self, dataloader, local_ep, lr, optim_choice, sampling_proportion):
+        logger.debug(
+            "Starting local update: batches=%s, local_ep=%s, lr=%s, optim=%s, binary=%s",
+            len(dataloader),
+            local_ep,
+            lr,
+            optim_choice,
+            is_binary_model(self.model),
+        )
         
         if optim_choice=="sgd":
         
@@ -193,11 +224,18 @@ class TrainerPrivate(object):
                         # loss = torch.tensor(0.).to(self.device)
 
                         pred = self.model(x)
-                        loss = self.mixup_criterion( F.cross_entropy, pred, targets_a, targets_b, lam)
-                        _, predicted = torch.max(pred.data, 1)
-                        total += y.size(0)
-                        correct += (lam * predicted.eq(targets_a.data).cpu().sum().float()
-                                    + (1 - lam) * predicted.eq(targets_b.data).cpu().sum().float())
+                        if is_binary_model(self.model):
+                            mixed_targets = lam * targets_a.float().view_as(pred) + (1 - lam) * targets_b.float().view_as(pred)
+                            loss = F.binary_cross_entropy_with_logits(pred, mixed_targets)
+                            predicted = (torch.sigmoid(pred).view_as(y.float()) >= 0.5).to(y.dtype)
+                            total += y.numel()
+                            correct += predicted.eq(y).cpu().sum().float()
+                        else:
+                            loss = self.mixup_criterion(F.cross_entropy, pred, targets_a.long(), targets_b.long(), lam)
+                            _, predicted = torch.max(pred.data, 1)
+                            total += y.size(0)
+                            correct += (lam * predicted.eq(targets_a.data).cpu().sum().float()
+                                        + (1 - lam) * predicted.eq(targets_b.data).cpu().sum().float())
                         #loss += F.cross_entropy(pred, y)
 
                         acc_meter+=100* correct/total
@@ -225,8 +263,8 @@ class TrainerPrivate(object):
                         loss = torch.tensor(0.).to(self.device)
 
                         pred = self.model(x)
-                        loss += F.cross_entropy(pred, y)
-                        acc_meter += accuracy(pred, y)[0].item()
+                        loss += classification_loss(self.model, pred, y)
+                        acc_meter += classification_accuracy(self.model, pred, y).item()
                         loss.backward()
 
                         self.optimizer.step() 
@@ -288,7 +326,9 @@ class TrainerPrivate(object):
                 param.data = param.data + torch.normal(torch.zeros(param.size()), self.sigma).to(self.device)
         
         
-        return self.model.state_dict(), np.mean(epoch_loss)
+        mean_loss = np.mean(epoch_loss)
+        logger.debug("Finished local update: mean_loss=%.6f", mean_loss)
+        return self.model.state_dict(), mean_loss
     
     def test(self, dataloader):
 
@@ -306,10 +346,17 @@ class TrainerPrivate(object):
                 target = target.to(self.device)
         
                 pred = self.model(data)  # test = 4
-                loss_meter += F.cross_entropy(pred, target, reduction='sum').item() #sum up batch loss
-                pred = pred.max(1, keepdim=True)[1] # get the index of the max log-probability
-                acc_meter += pred.eq(target.view_as(pred)).sum().item()
-                runcount += data.size(0) 
+                if is_binary_model(self.model):
+                    loss_meter += classification_loss(self.model, pred, target, reduction='sum').item()
+                    pred_label = (torch.sigmoid(pred).view(-1) >= 0.5).to(target.dtype)
+                    target_flat = target.view(-1)
+                    acc_meter += pred_label.eq(target_flat).sum().item()
+                    runcount += target_flat.numel()
+                else:
+                    loss_meter += F.cross_entropy(pred, target.long(), reduction='sum').item() #sum up batch loss
+                    pred = pred.max(1, keepdim=True)[1] # get the index of the max log-probability
+                    acc_meter += pred.eq(target.view_as(pred)).sum().item()
+                    runcount += data.size(0)
 
         loss_meter /= runcount
         acc_meter /= runcount

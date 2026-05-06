@@ -4,6 +4,7 @@ import errno
 import os
 import sys
 import random
+import logging
 
 import torch
 import torchvision
@@ -14,6 +15,9 @@ from utils.sampling import *
 from collections import defaultdict
 from torchvision.datasets.folder import pil_loader, make_dataset, IMG_EXTENSIONS
 
+
+logger = logging.getLogger(__name__)
+
 def setup_seed(seed):
      torch.manual_seed(seed)
      torch.cuda.manual_seed_all(seed)
@@ -22,7 +26,28 @@ def setup_seed(seed):
      torch.backends.cudnn.deterministic = True
 
 
-def get_data(dataset, data_root, iid, num_users,data_aug, noniid_beta):
+def _make_binn_synthetic_dataset(n_samples, input_size, seed, signal_strength=2.0):
+    generator = torch.Generator().manual_seed(int(seed))
+    x = torch.randn(int(n_samples), int(input_size), generator=generator)
+
+    # Sparse, nonlinear signal spread over gene groups. The generated labels are
+    # intentionally simple but not linearly trivial, so FL smoke tests exercise
+    # the BINN hierarchy without needing protected medical data.
+    informative = min(int(input_size), 24)
+    weights = torch.zeros(int(input_size), 1)
+    weights[:informative] = torch.randn(informative, 1, generator=generator)
+    group_term = torch.sin(x[:, :informative]).matmul(weights[:informative]).view(-1)
+    if input_size >= 8:
+        interaction = x[:, 0] * x[:, 1] - 0.5 * x[:, 2] * x[:, 3]
+    else:
+        interaction = x[:, 0]
+    logits = float(signal_strength) * (group_term + interaction)
+    threshold = torch.median(logits)
+    y = (logits > threshold).float().view(-1, 1)
+    return torch.utils.data.TensorDataset(x.float(), y)
+
+
+def get_data(dataset, data_root, iid, num_users, data_aug, noniid_beta, args=None):
     ds = dataset 
     
     if ds == 'cifar10':
@@ -139,9 +164,37 @@ def get_data(dataset, data_root, iid, num_users,data_aug, noniid_beta):
         total_set[1]=total_set[1][random_index]
         train_set=torch.utils.data.TensorDataset(total_set[0][0:20000],total_set[1][0:20000] )
         test_set=torch.utils.data.TensorDataset(total_set[0][-2000:],total_set[1][-2000:] )
+        train_set_mia = train_set
+        test_set_mia = test_set
+
+    if ds == 'binn_synthetic':
+        if args is None:
+            raise ValueError("BINN synthetic data requires args for sizing and seed.")
+        train_set = _make_binn_synthetic_dataset(
+            args.binn_synthetic_samples,
+            args.binn_input_size,
+            args.seed,
+            args.binn_synthetic_signal,
+        )
+        test_set = _make_binn_synthetic_dataset(
+            args.binn_synthetic_test_samples,
+            args.binn_input_size,
+            args.seed + 1009,
+            args.binn_synthetic_signal,
+        )
+        train_set_mia = train_set
+        test_set_mia = test_set
+        logger.info(
+            "Generated BINN synthetic dataset: train=%s, test=%s, features=%s",
+            len(train_set),
+            len(test_set),
+            args.binn_input_size,
+        )
 
     if iid:
         dict_users, train_idxs, val_idxs = cifar_iid_MIA(train_set, num_users)
+    elif ds == 'binn_synthetic':
+        dict_users, train_idxs, val_idxs = label_beta(train_set, noniid_beta, num_users)
     else:
         dict_users, train_idxs, val_idxs = cifar_beta(train_set, noniid_beta, num_users)
 

@@ -10,6 +10,9 @@ import json
 import glob
 import logging
 
+from attacks.fedmia import FedMIAConfig
+from attacks.repo_adapter import evaluate_artifact_series
+
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -30,16 +33,20 @@ def liratio(mu_in,mu_out,var_in,var_out,new_samples):
 
 @ torch.no_grad()
 def hinge_loss_fn(x,y):
-    x,y=copy.deepcopy(x).cuda(),copy.deepcopy(y).cuda()
-    mask=torch.eye(x.shape[1],device="cuda")[y].bool()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    x,y=copy.deepcopy(x).to(device),copy.deepcopy(y).to(device)
+    mask=torch.eye(x.shape[1],device=device)[y].bool()
     tmp1=x[mask]
     x[mask]=-1e10
     tmp2=torch.max(x,dim=1)[0]
     return (tmp1-tmp2).cpu().numpy()
 
 def ce_loss_fn(x,y):
+    if x.dim() == 2 and x.shape[1] == 1:
+        loss_fn = torch.nn.BCEWithLogitsLoss(reduction='none')
+        return loss_fn(x, y.float().view_as(x)).view(-1)
     loss_fn=torch.nn.CrossEntropyLoss(reduction='none')
-    return loss_fn(x,y)
+    return loss_fn(x,y.long())
 
 def extract_hinge_loss(i):
     val_dict={}
@@ -114,308 +121,37 @@ def common_attack(f,K,epch,extract_fn=None):
     return accs,tprs,auc,log_auc,(target_test_loss,target_train_loss)
 
 def lira_attack_ldh_cosine(f,epch,K, save_dir, extract_fn=None,attack_mode="cos"):
-    # attack_mode="cos"
     logging.info('******************************************************')
     logging.info(f'************Epch: {epch}, attack_mode: {attack_mode} **************')
     logging.info('******************************************************')
-    save_log=save_dir + '/' + f'attack_sel{select_mode}_{select_method}_{attack_mode}.log'
     accs=[]
     training_res=[]
     for i in range(K):
-        
-        # training_res.append(torch.load(f.format(i,epch),map_location=lambda storage, loc: storage))
         training_res.append(torch.load(f.format(i,epch)))
         accs.append(training_res[-1]["test_acc"])
-    
-    target_idx=0
-    val_idx = 1
-    target_res=training_res[target_idx]
-    shadow_res=training_res[val_idx:]
-    #logging.info(target_res["tarin_cos"])
-    if attack_mode=="cos":
-        target_train_loss=torch.tensor(target_res["tarin_cos"]).cpu().numpy()
-        if MODE=="test":
-            target_test_loss=torch.tensor(target_res["test_cos"]).cpu().numpy()
-        elif MODE=="val":
-            target_test_loss=torch.tensor(target_res["val_cos"]).cpu().numpy()
-        elif MODE =='mix':
-            random_indices = torch.randperm(target_res["test_cos"].shape[0])
-            target_test_loss = target_res["test_cos"][random_indices[:mix_length]]
-            target_test_loss = torch.tensor(target_test_loss).cpu().numpy()
-            mix_test_loss = torch.tensor(target_res["mix_cos"]).cpu().numpy()
-            mix_test_loss = np.concatenate([target_test_loss,mix_test_loss],axis=0)
-            logging.info(f'mix_test_loss shape: {mix_test_loss.shape}')
-            target_test_loss = mix_test_loss
 
-    if attack_mode=="diff":
-        target_train_loss=torch.tensor(target_res["tarin_diffs"]).cpu().numpy()
-        if MODE=="test":
-            target_test_loss=torch.tensor(target_res["test_diffs"]).cpu().numpy()
-        elif MODE=="val":
-            target_test_loss=torch.tensor(target_res["val_diffs"]).cpu().numpy()
-    if attack_mode == 'loss':
-        target_train_loss = -ce_loss_fn(target_res["train_res"]["logit"] , target_res["train_res"]["labels"] ).cpu().numpy()
-        if MODE=="test":
-            target_test_loss=-ce_loss_fn(target_res["test_res"]["logit"] , target_res["test_res"]["labels"] ).cpu().numpy()
-        elif MODE=="val":
-            target_test_loss=-ce_loss_fn(target_res["val_res"]["logit"] , target_res["val_res"]["labels"] ).cpu().numpy()
-        elif MODE == 'mix':
-            random_indices = torch.randperm(target_res["test_res"]["logit"].shape[0])
-            target_test_loss =-ce_loss_fn(target_res["test_res"]["logit"][random_indices[:mix_length]],\
-                                            target_res["test_res"]["labels"][random_indices[:mix_length]])
-            target_test_loss = torch.tensor(target_test_loss).cpu().numpy()
-            mix_test_loss=-ce_loss_fn(target_res["mix_res"]["logit"] , target_res["mix_res"]["labels"] ).cpu().numpy()
-            mix_test_loss = np.concatenate([target_test_loss,mix_test_loss],axis=0)
-            logging.info(f'mix_test_loss shape: {mix_test_loss.shape}')
-            target_test_loss = mix_test_loss
+    config = FedMIAConfig(
+        threshold=0.5,
+        outlier_std_factor=3.0 if (select_mode == 1 and attack_mode == "cos" and select_method == "outlier") else 1e12,
+        min_variance=1e-8,
+    )
+    evaluation = evaluate_artifact_series(
+        epoch_training_results=[training_res],
+        attack_mode=attack_mode,
+        mode=MODE,
+        mix_length=mix_length if MODE == "mix" else None,
+        config=config,
+    )
 
-    shadow_train_losses=[]
-    shadow_test_losses=[]
-    if attack_mode=="cos":
-        for i in shadow_res:
-            shadow_train_losses.append( torch.tensor(i["tarin_cos"]).cpu().numpy() )
-            if MODE=="val":
-                shadow_test_losses.append(torch.tensor(i["val_cos"]).cpu().numpy() )
-            elif MODE=="test":
-                shadow_test_losses.append(torch.tensor(i["test_cos"]).cpu().numpy() )
-            elif MODE =='mix':
-                random_indices = torch.randperm(i["test_cos"].shape[0])
-                shadow_test_loss = i["test_cos"][random_indices[:mix_length]]
-                shadow_test_loss = torch.tensor(shadow_test_loss).cpu().numpy()
-                mix_test_loss = torch.tensor(i["mix_cos"]).cpu().numpy()
-                mix_test_loss = np.concatenate([shadow_test_loss,mix_test_loss],axis=0)
-                logging.info(f'mix_test_loss shape: {mix_test_loss.shape}')
-                shadow_test_losses.append(mix_test_loss)
-    elif attack_mode=="diff":
-        for i in shadow_res:
-            shadow_train_losses.append( torch.tensor(i["tarin_diffs"]).cpu().numpy() )
-            if MODE=="val":
-                shadow_test_losses.append(torch.tensor(i["val_diffs"]).cpu().numpy() )
-            elif MODE=="test":
-                shadow_test_losses.append(torch.tensor(i["test_diffs"]).cpu().numpy() )
-    elif attack_mode=="loss":
-        for i in shadow_res:
-            shadow_train_losses.append(-ce_loss_fn(i["train_res"]["logit"] , i["train_res"]["labels"]).cpu().numpy() )
-            if MODE=="val":
-                shadow_test_losses.append(-ce_loss_fn(i["val_res"]["logit"], i["val_res"]["labels"]).cpu().numpy() )
-            elif MODE=="test":
-                shadow_test_losses.append(-ce_loss_fn(i["test_res"]["logit"], i["test_res"]["labels"]).cpu().numpy() )
-            elif MODE == 'mix':
-                random_indices = torch.randperm(i["test_res"]["logit"].shape[0])
-                shadow_test_loss =-ce_loss_fn(i["test_res"]["logit"][random_indices[:mix_length]],\
-                                                i["test_res"]["labels"][random_indices[:mix_length]])
-                shadow_test_loss = torch.tensor(shadow_test_loss).cpu().numpy()
-                mix_test_loss=-ce_loss_fn(i["mix_res"]["logit"] , i["mix_res"]["labels"] ).cpu().numpy()
-                mix_test_loss = np.concatenate([shadow_test_loss,mix_test_loss],axis=0)
-                logging.info(f'mix_test_loss shape: {mix_test_loss.shape}')
-                shadow_test_losses.append(mix_test_loss)
+    train_l_out = np.array(evaluation.member_scores.aggregate_scores)
+    test_l_out = np.array(evaluation.nonmember_scores.aggregate_scores)
+    auc = evaluation.auc
+    log_auc = evaluation.log_auc
+    tprs = evaluation.tprs
 
-    shadow_train_losses_stack=np.vstack( shadow_train_losses )
-    shadow_test_losses_stack=np.vstack( shadow_test_losses )
-    
-
-    ## 打印local model统计信息，观察结果
-    logging.info(f'mean 0 \t train: {target_train_loss.mean(axis=0)}, \tvar: {target_train_loss.var(axis=0)}, \t test: {target_test_loss.mean(axis=0)}, \tvar: {target_test_loss.var(axis=0)}')
-
-    i=1
-    for train_loss, test_loss in zip(shadow_train_losses, shadow_test_losses):
-        logging.info(f'mean {i} \t train: {train_loss.mean(axis=0)}, \tvar: {train_loss.var(axis=0)}, \t test: {test_loss.mean(axis=0)}, \tvar: {test_loss.var(axis=0)}')
-        i+=1
-    view_list = [0,1,2,3,4, 500,501,502,503,504, -5,-4,-3,-2,-1]
-    logging.info('########### Training samples: ############')
-    logging.info('Sample  ')
-    for j in view_list:
-        logging.info(f'{j}      \t')
-    logging.info('')
-    ### 第0个client
-    logging.info('Client 0 ', )
-    for j in view_list:
-        view_score = '%.6f' % target_train_loss[j]
-        logging.info(f'{view_score} \t')
-    logging.info('')
-    ### 输出统计信息
-    logging.info('Mean ', )
-    for j in view_list:
-        view_score = '%.6f' % np.mean(shadow_train_losses_stack, axis=0)[j]
-        logging.info(f'{view_score} \t')
-    logging.info('')
-    logging.info('Var  ', )
-    for j in view_list:
-        view_score = '%.6f' % np.var(shadow_train_losses_stack, axis=0)[j]
-        logging.info(f'{view_score} \t')
-    logging.info('')
-    
-    ### 第1-9个client
-    for i, train_loss in zip(range(1,K), shadow_train_losses):
-        logging.info(f'Client {i} ')
-        for j in view_list:
-            view_score = '%.6f' % train_loss[j]
-            logging.info(f'{view_score} \t', )
-        logging.info('')
-    logging.info('')
-    logging.info('########### Testing samples: ############')
-    ### 第0个client
-    logging.info('Client 0', )
-    for j in view_list:
-        view_score = '%.6f' % target_test_loss[j]
-        logging.info(f'{view_score} \t')
-    logging.info('')
-
-    logging.info('Mean ', )
-    for j in view_list:
-        view_score = '%.6f' % np.mean(shadow_test_losses_stack, axis=0)[j]
-        logging.info(f'{view_score} \t')
-    logging.info('')
-    logging.info('Var  ', )
-    for j in view_list:
-        view_score = '%.6f' % np.var(shadow_test_losses_stack, axis=0)[j]
-        logging.info(f'{view_score} \t')
-    logging.info('')
-    ### 第1-9个client
-    for i, test_loss in zip(range(1,K ), shadow_test_losses):
-        logging.info(f'Client {i} ', )
-        for j in view_list:
-            view_score = '%.6f' % test_loss[j]
-            logging.info(f'{view_score} \t')
-        logging.info('')
-    logging.info(f'select_mode: {select_mode}, type: {type(select_mode)}')
-    logging.info(f'select_method: {select_method}')
-    logging.info(f'attack_mode: {attack_mode}')
-
-    if select_mode == 1 and attack_mode =='cos':
-        
-        tmps=[]
-        means=[]
-        client_ids=[]
-        
-        if select_method == 'outlier':
-            # shadow_mdm_stack = np.vstack(shadow_train_losses_stack, shadow_test_losses_stack)
-            train_mu_out=np.zeros_like(shadow_train_losses_stack.mean(axis=0))
-            train_var_out=np.zeros_like(shadow_train_losses_stack.var(axis=0)+1e-8)
-            logging.info(f'************** train_mu_out shape: {train_mu_out.shape}')
-            test_mu_out=np.zeros_like(shadow_test_losses_stack.mean(axis=0))
-            test_var_out=np.zeros_like(shadow_test_losses_stack.var(axis=0)+1e-8)
-
-            for j in range(0,shadow_train_losses_stack.shape[1]):
-                mask = shadow_train_losses_stack[:,j] < shadow_train_losses_stack[:,j].mean(axis=0) + 3*shadow_train_losses_stack[:,j].std(axis=0)
-                sel_mdm = shadow_train_losses_stack[:,j][mask]
-                if j %2000==0:
-                    logging.info(' train outlier view:')
-                    logging.info(shadow_train_losses_stack[:,j])
-                    logging.info(target_train_loss[j])
-                    logging.info(f'sel_mdm.shape: {sel_mdm.shape}')
-                if sel_mdm.shape[0]==0:
-                    if j % 50 == 0:
-                        logging.info('outlier view:')
-                        logging.info(f'mask: {mask}')
-                        logging.info(shadow_train_losses_stack[:,j])
-                        logging.info(target_train_loss[j])
-                    sel_mdm=np.array([np.min(shadow_train_losses_stack[:,j])])
-                train_mu_out[j] = np.mean(sel_mdm, axis=0)
-                train_var_out[j] = np.var(sel_mdm, axis=0)+1e-8
-            
-            for j in range(0,shadow_test_losses_stack.shape[1]):
-                mask = shadow_test_losses_stack[:,j] < shadow_test_losses_stack[:,j].mean(axis=0) + 3*shadow_test_losses_stack[:,j].std(axis=0)
-                sel_mdm = shadow_test_losses_stack[:,j][mask]
-                if j % 10==0:
-                    logging.info('outlier view:')
-                    logging.info(shadow_test_losses_stack[:,j])
-                    logging.info(target_test_loss[j])
-                    logging.info(mask)
-                    logging.info(f'sel_mdm.shape: {sel_mdm.shape}')
-                # sel_mdm = np.sort(shadow_test_losses_stack[:,j])[2:3+SHADOW_NUM]
-                # sel_mdm = shadow_test_losses_stack[:,j][mask]
-                
-                if j %2000==0:
-                    logging.info('test outlier view:')
-                    logging.info(shadow_test_losses_stack[:,j])
-                    logging.info(target_test_loss[j])
-                    logging.info(f'sel_mdm.shape: {sel_mdm.shape}')
-                if sel_mdm.shape[0]==0:
-                    if j % 50==0:
-                        logging.info('outlier view:')
-                        logging.info(shadow_test_losses_stack[:,j])
-                        logging.info(target_test_loss[j])
-                        logging.info(f'sel_mdm.shape: {sel_mdm.shape}')
-                    sel_mdm=np.array([np.min(shadow_test_losses_stack[:,j])])
-                test_mu_out[j] = np.mean(sel_mdm, axis=0)
-                test_var_out[j] = np.var(sel_mdm, axis=0)+1e-8    
-
-    ## 计算均值和方差，以备分布估计
-    if attack_mode != 'cos'or select_mode == 0 or (select_method != 'mean_per' and select_method != 'outlier'):
-        train_mu_out=shadow_train_losses_stack.mean(axis=0)
-        train_var_out=shadow_train_losses_stack.var(axis=0)+1e-8
-
-        test_mu_out=shadow_test_losses_stack.mean(axis=0)
-        test_var_out=shadow_test_losses_stack.var(axis=0)+1e-8
-
-    if epch % 50 ==0:
-        logging.info(f'target_train_loss: {target_train_loss[0:10]}')
-        logging.info(f'train_mu_out: {train_mu_out[0:10]}')
-
-        logging.info(f'target_test_loss: {target_test_loss[0:10]}')
-        logging.info(f'test_mu_out: {test_mu_out[0:10]}')
-
-    # 计算概率密度
-    # train_l_out=scipy.stats.norm.cdf(target_train_loss,train_mu_out,np.sqrt(train_var_out))
-    # # train_l_out=1-scipy.stats.norm.cdf(target_train_loss,test_mu_out,np.sqrt(test_var_out))
-    # train_mu_out = np.ones_like(target_train_loss) * test_mu_out.mean(axis=0)
-    # train_var_out = np.ones_like(target_train_loss) * test_var_out.mean(axis=0)
-
-    train_l_out=scipy.stats.norm.cdf(target_train_loss,train_mu_out,np.sqrt(train_var_out))
-    test_l_out=scipy.stats.norm.cdf(target_test_loss,test_mu_out,np.sqrt(test_var_out))
-    logging.info(f'var of train: {np.sqrt(train_var_out).mean(axis=0)}, var of test: {np.sqrt(test_var_out).mean(axis=0)}')
-
-    logging.info(f'attack_mode: {attack_mode}')
-
-    logging.info(f'mean of train_l_out: {train_l_out.mean(axis=0)}, var of train_l_out: {train_l_out.var(axis=0)}')
-    logging.info(f'mean of test_l_out: {test_l_out.mean(axis=0)}, var of test_l_out: {test_l_out.var(axis=0)}')
-    logging.info(f'test_l_out.shape: {test_l_out.shape}')
-    logging.info('Checking traing sample score:')
-    logging.info(train_l_out[0:5])
-    logging.info(train_l_out[100:105])
-    logging.info(train_l_out[500:505])
-    logging.info(train_l_out[1500:1505])
-    logging.info('Checking test sample score:')
-    logging.info(test_l_out[0:5])
-    logging.info(test_l_out[100:105])
-    logging.info(test_l_out[500:505])
-    logging.info(test_l_out[1500:1505])
-    
-    outlier_indexs = np.array(np.where(test_l_out > 0.8))
-    logging.info("###################################")
-    logging.info(f'############# outlier view, num: {outlier_indexs.shape}')
-    logging.info("###################################")
-    logging.info(test_l_out[outlier_indexs[0,0:5]])
-    logging.info(target_test_loss[outlier_indexs[0,0:5]])
-    logging.info(shadow_test_losses_stack[:,[outlier_indexs[0,0:5]]] )
-    logging.info('____________________________')
-    logging.info(test_l_out[outlier_indexs[0,20:25]])
-    logging.info(target_test_loss[outlier_indexs[0,20:25]])
-    logging.info(shadow_test_losses_stack[:,[outlier_indexs[0,20:25]]] )
-    logging.info('____________________________')
-    logging.info(test_l_out[outlier_indexs[0,50:55]])
-    logging.info(target_test_loss[outlier_indexs[0,50:55]])
-    logging.info(shadow_test_losses_stack[:,[outlier_indexs[0,50:55]]] )
-    logging.info('____________________________')
-    logging.info(test_l_out[outlier_indexs[0,100:105]])
-    logging.info(target_test_loss[outlier_indexs[0,100:105]])
-    logging.info(shadow_test_losses_stack[:,[outlier_indexs[0,100:105]]] )
-
-    logging.info('mem outlier view')
-    outlier_indexs = np.array(np.where(train_l_out <0.5))
-    logging.info(f'outlier num: {outlier_indexs.shape}')
-    logging.info(train_l_out[outlier_indexs[0,0:5]])
-    logging.info(target_train_loss[outlier_indexs[0,0:5]])
-    logging.info(shadow_train_losses_stack[:,[outlier_indexs[0,0:5]]] )
-    logging.info('____________________________')
-    logging.info(train_l_out[outlier_indexs[0,20:25]])
-    logging.info(target_train_loss[outlier_indexs[0,20:25]])
-    logging.info(shadow_train_losses_stack[:,[outlier_indexs[0,20:25]]] )
-
-    auc,log_auc,tprs=plot_auc("lira",torch.tensor(test_l_out),torch.tensor(train_l_out),epch)
-    # auc,log_auc,tprs=plot_auc("lira", (torch.tensor((test_mu_out))), (torch.tensor((train_mu_out))),epch)
-    if epch % 10 ==0:
+    logging.info("Portable FedMIA round evaluation complete.")
+    logging.info(f"member_mean={train_l_out.mean():.6f}, nonmember_mean={test_l_out.mean():.6f}")
+    if epch % 10 == 0:
         logging.info("_______________lira_attack")
         logging.info(f"tprs:{tprs}, {log_auc}")
 

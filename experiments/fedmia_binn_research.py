@@ -75,7 +75,7 @@ def parse_args():
     parser.add_argument("--threshold", type=float, default=0.5, help="FedMIA delta threshold")
     parser.add_argument(
         "--threshold-grid",
-        default="0.30,0.40,0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90",
+        default="0.001,0.005,0.01,0.02,0.05,0.10,0.20,0.30,0.40,0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90",
         help="comma-separated deltas used to report threshold-sweep F1 diagnostics",
     )
     parser.add_argument("--outlier-std-factor", type=float, default=3.0, help="FedMIA 3-sigma filter")
@@ -425,6 +425,36 @@ def measure_round(global_model, target_update, reference_updates, samples, devic
     )
 
 
+def negative_loss_measurements(model, samples, device) -> List[float]:
+    """
+    FedMIA can use measurements other than gradient similarity.
+
+    For the loss variant, lower sample loss is stronger member evidence. The
+    scoring code expects larger measurements to be more member-like, so we use
+    negative BCE loss as the per-sample measurement.
+    """
+    model.eval()
+    values = []
+    with torch.no_grad():
+        for x, y in samples:
+            logits = model(x.unsqueeze(0).to(device))
+            loss = binary_loss(logits, y.view(1, 1).to(device))
+            values.append(-float(loss.item()))
+    return values
+
+
+def measure_loss_round(target_model, reference_models, samples, device, round_id, split):
+    return FedMIARoundMeasurements(
+        target_measurements=negative_loss_measurements(target_model, samples, device),
+        reference_measurements=[
+            negative_loss_measurements(reference_model, samples, device)
+            for reference_model in reference_models
+        ],
+        round_id=round_id,
+        metadata={"split": split, "measurement": "negative_loss"},
+    )
+
+
 def confusion_metrics(evaluation) -> Dict[str, float]:
     return confusion_metrics_from_predictions(
         evaluation.member_scores.predictions,
@@ -471,24 +501,143 @@ def parse_threshold_grid(value: str) -> List[float]:
     return sorted(set(thresholds))
 
 
-def metrics_at_threshold(evaluation, threshold: float) -> Dict[str, float]:
-    member_predictions = [
-        1 if score > threshold else 0
-        for score in evaluation.member_scores.aggregate_scores
-    ]
-    nonmember_predictions = [
-        1 if score > threshold else 0
-        for score in evaluation.nonmember_scores.aggregate_scores
-    ]
+def metrics_from_scores(
+    member_scores: Sequence[float],
+    nonmember_scores: Sequence[float],
+    threshold: float,
+) -> Dict[str, float]:
+    member_predictions = [1 if score > threshold else 0 for score in member_scores]
+    nonmember_predictions = [1 if score > threshold else 0 for score in nonmember_scores]
     metrics = confusion_metrics_from_predictions(member_predictions, nonmember_predictions)
     metrics["threshold"] = threshold
     return metrics
 
 
-def threshold_sweep(evaluation, thresholds: Sequence[float]) -> List[Dict[str, float]]:
-    rows = [metrics_at_threshold(evaluation, threshold) for threshold in thresholds]
+def metrics_at_threshold(evaluation, threshold: float) -> Dict[str, float]:
+    return metrics_from_scores(
+        evaluation.member_scores.aggregate_scores,
+        evaluation.nonmember_scores.aggregate_scores,
+        threshold,
+    )
+
+
+def threshold_sweep_scores(
+    member_scores: Sequence[float],
+    nonmember_scores: Sequence[float],
+    thresholds: Sequence[float],
+) -> List[Dict[str, float]]:
+    rows = [
+        metrics_from_scores(member_scores, nonmember_scores, threshold)
+        for threshold in thresholds
+    ]
     rows.sort(key=lambda row: (row["f1"], row["tnr"], row["tpr"]), reverse=True)
     return rows
+
+
+def threshold_sweep(evaluation, thresholds: Sequence[float]) -> List[Dict[str, float]]:
+    return threshold_sweep_scores(
+        evaluation.member_scores.aggregate_scores,
+        evaluation.nonmember_scores.aggregate_scores,
+        thresholds,
+    )
+
+
+def roc_curve_from_scores(member_scores: Sequence[float], nonmember_scores: Sequence[float]):
+    labeled_scores = [(float(score), 1) for score in member_scores] + [
+        (float(score), 0) for score in nonmember_scores
+    ]
+    labeled_scores.sort(key=lambda item: item[0], reverse=True)
+
+    positives = max(len(member_scores), 1)
+    negatives = max(len(nonmember_scores), 1)
+    tps = 0
+    fps = 0
+    fpr_values = [0.0]
+    tpr_values = [0.0]
+    for _, label in labeled_scores:
+        if label == 1:
+            tps += 1
+        else:
+            fps += 1
+        fpr_values.append(fps / negatives)
+        tpr_values.append(tps / positives)
+    if fpr_values[-1] != 1.0 or tpr_values[-1] != 1.0:
+        fpr_values.append(1.0)
+        tpr_values.append(1.0)
+    return fpr_values, tpr_values
+
+
+def trapezoid_auc(xs: Sequence[float], ys: Sequence[float]) -> float:
+    area = 0.0
+    for idx in range(1, len(xs)):
+        area += (xs[idx] - xs[idx - 1]) * (ys[idx] + ys[idx - 1]) / 2.0
+    return area
+
+
+def log_auc_from_roc(fprs: Sequence[float], tprs: Sequence[float]) -> float:
+    log_fprs = []
+    log_tprs = []
+    for fpr, tpr in zip(fprs, tprs):
+        log_fprs.append((math.log10(max(float(fpr), 1e-5)) + 5.0) / 5.0)
+        log_tprs.append((math.log10(max(float(tpr), 1e-5)) + 5.0) / 5.0)
+    return trapezoid_auc(log_fprs, log_tprs)
+
+
+def tprs_at_fprs(fprs: Sequence[float], tprs: Sequence[float]) -> Dict[str, float]:
+    summary = {}
+    for threshold in (0.1, 0.01):
+        best_tpr = 0.0
+        for fpr, tpr in zip(fprs, tprs):
+            if fpr < threshold:
+                best_tpr = tpr
+        summary[str(threshold)] = best_tpr
+    return summary
+
+
+def score_list_metrics(
+    member_scores: Sequence[float],
+    nonmember_scores: Sequence[float],
+    threshold: float,
+    thresholds: Sequence[float],
+) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
+    metrics = metrics_from_scores(member_scores, nonmember_scores, threshold)
+    fprs, tprs = roc_curve_from_scores(member_scores, nonmember_scores)
+    sweep_rows = threshold_sweep_scores(member_scores, nonmember_scores, thresholds)
+    best_threshold_metrics = sweep_rows[0] if sweep_rows else {
+        "threshold": threshold,
+        "f1": metrics["f1"],
+        "tpr": metrics["tpr"],
+        "tnr": metrics["tnr"],
+    }
+    tpr_summary = tprs_at_fprs(fprs, tprs)
+    metrics.update(
+        {
+            "auc": trapezoid_auc(fprs, tprs),
+            "log_auc": log_auc_from_roc(fprs, tprs),
+            "tpr_at_fpr_0.1": tpr_summary["0.1"],
+            "tpr_at_fpr_0.01": tpr_summary["0.01"],
+            "member_score_mean": float(np.mean(member_scores)),
+            "nonmember_score_mean": float(np.mean(nonmember_scores)),
+            "best_f1_threshold": best_threshold_metrics["threshold"],
+            "best_f1": best_threshold_metrics["f1"],
+            "best_f1_tpr": best_threshold_metrics["tpr"],
+            "best_f1_tnr": best_threshold_metrics["tnr"],
+        }
+    )
+    return metrics, sweep_rows
+
+
+def evaluation_metrics(evaluation, threshold: float, thresholds: Sequence[float]):
+    return score_list_metrics(
+        evaluation.member_scores.aggregate_scores,
+        evaluation.nonmember_scores.aggregate_scores,
+        threshold,
+        thresholds,
+    )
+
+
+def prefix_metrics(prefix: str, metrics: Dict[str, float]) -> Dict[str, float]:
+    return {f"{prefix}_{key}": value for key, value in metrics.items()}
 
 
 def run_one_trajectory(
@@ -526,8 +675,10 @@ def run_one_trajectory(
 
     global_model = binn(graph=graph, output_size=1, dropout_prob=0.0, output_last_layers=1).to(device)
     initial_acc = model_accuracy(global_model, combined_loader, device)
-    member_rounds = []
-    nonmember_rounds = []
+    cosine_member_rounds = []
+    cosine_nonmember_rounds = []
+    loss_member_rounds = []
+    loss_nonmember_rounds = []
 
     LOGGER.info("run=%03d started seed=%s initial_acc=%.4f", run_id, run_seed, initial_acc)
     for round_id in range(1, args.rounds + 1):
@@ -535,6 +686,7 @@ def run_one_trajectory(
         global_state = copy.deepcopy(global_model.state_dict())
         local_states = []
         local_updates = []
+        local_models = []
         local_losses = []
         start_acc = model_accuracy(global_model, combined_loader, device)
         LOGGER.info("run=%03d round=%03d start global_acc=%.4f", run_id, round_id, start_acc)
@@ -555,9 +707,9 @@ def run_one_trajectory(
             local_losses.append(local_loss)
             parameter_names = [name for name, _ in local_model.named_parameters()]
             local_updates.append(state_update(global_state, local_state, parameter_names))
-            del local_model
+            local_models.append(local_model)
 
-        member_rounds.append(
+        cosine_member_rounds.append(
             measure_round(
                 global_model,
                 target_update=local_updates[0],
@@ -568,7 +720,7 @@ def run_one_trajectory(
                 split="member",
             )
         )
-        nonmember_rounds.append(
+        cosine_nonmember_rounds.append(
             measure_round(
                 global_model,
                 target_update=local_updates[0],
@@ -579,17 +731,41 @@ def run_one_trajectory(
                 split="nonmember",
             )
         )
+        loss_member_rounds.append(
+            measure_loss_round(
+                target_model=local_models[0],
+                reference_models=local_models[1:],
+                samples=member_samples,
+                device=device,
+                round_id=round_id,
+                split="member",
+            )
+        )
+        loss_nonmember_rounds.append(
+            measure_loss_round(
+                target_model=local_models[0],
+                reference_models=local_models[1:],
+                samples=nonmember_samples,
+                device=device,
+                round_id=round_id,
+                split="nonmember",
+            )
+        )
 
         averaged_state = fed_avg_state_dicts(local_states, [len(dataset) for dataset in client_datasets])
         global_model.load_state_dict(averaged_state)
+        del local_models
         end_acc = model_accuracy(global_model, combined_loader, device)
         round_elapsed = time.time() - round_start
         LOGGER.info(
-            "run=%03d round=%03d end global_acc=%.4f mean_client_loss=%.6f elapsed=%.2fs",
+            "run=%03d round=%03d end global_acc=%.4f mean_client_loss=%.6f "
+            "cosine_rounds=%s loss_rounds=%s elapsed=%.2fs",
             run_id,
             round_id,
             end_acc,
             float(np.mean(local_losses)),
+            len(cosine_member_rounds),
+            len(loss_member_rounds),
             round_elapsed,
         )
         append_jsonl(
@@ -601,54 +777,80 @@ def run_one_trajectory(
                 "global_acc_start": start_acc,
                 "global_acc_end": end_acc,
                 "mean_client_loss": float(np.mean(local_losses)),
+                "measurements": ["gradient_cosine", "negative_loss"],
                 "elapsed_seconds": round_elapsed,
             },
         )
 
     final_acc = model_accuracy(global_model, combined_loader, device)
-    evaluation = evaluate_membership(
-        member_rounds,
-        nonmember_rounds,
-        config=FedMIAConfig(
-            threshold=args.threshold,
-            outlier_std_factor=args.outlier_std_factor,
-            min_variance=args.min_variance,
-        ),
+    fedmia_config = FedMIAConfig(
+        threshold=args.threshold,
+        outlier_std_factor=args.outlier_std_factor,
+        min_variance=args.min_variance,
     )
-    metrics = confusion_metrics(evaluation)
-    sweep_rows = threshold_sweep(evaluation, parse_threshold_grid(args.threshold_grid))
-    best_threshold_metrics = sweep_rows[0] if sweep_rows else {
-        "threshold": args.threshold,
-        "f1": metrics["f1"],
-        "tpr": metrics["tpr"],
-        "tnr": metrics["tnr"],
-    }
-    metrics.update(
-        {
-            "auc": evaluation.auc,
-            "log_auc": evaluation.log_auc,
-            "tpr_at_fpr_0.1": evaluation.tprs["0.1"],
-            "tpr_at_fpr_0.01": evaluation.tprs["0.01"],
-            "member_score_mean": float(np.mean(evaluation.member_scores.aggregate_scores)),
-            "nonmember_score_mean": float(np.mean(evaluation.nonmember_scores.aggregate_scores)),
-            "best_f1_threshold": best_threshold_metrics["threshold"],
-            "best_f1": best_threshold_metrics["f1"],
-            "best_f1_tpr": best_threshold_metrics["tpr"],
-            "best_f1_tnr": best_threshold_metrics["tnr"],
-        }
+    threshold_grid = parse_threshold_grid(args.threshold_grid)
+    cosine_evaluation = evaluate_membership(
+        cosine_member_rounds,
+        cosine_nonmember_rounds,
+        config=fedmia_config,
     )
+    loss_evaluation = evaluate_membership(
+        loss_member_rounds,
+        loss_nonmember_rounds,
+        config=fedmia_config,
+    )
+    combined_member_scores = [
+        (cosine_score + loss_score) / 2.0
+        for cosine_score, loss_score in zip(
+            cosine_evaluation.member_scores.aggregate_scores,
+            loss_evaluation.member_scores.aggregate_scores,
+        )
+    ]
+    combined_nonmember_scores = [
+        (cosine_score + loss_score) / 2.0
+        for cosine_score, loss_score in zip(
+            cosine_evaluation.nonmember_scores.aggregate_scores,
+            loss_evaluation.nonmember_scores.aggregate_scores,
+        )
+    ]
+
+    cosine_metrics, cosine_sweep_rows = evaluation_metrics(
+        cosine_evaluation, args.threshold, threshold_grid
+    )
+    loss_metrics, loss_sweep_rows = evaluation_metrics(
+        loss_evaluation, args.threshold, threshold_grid
+    )
+    combined_metrics, combined_sweep_rows = score_list_metrics(
+        combined_member_scores,
+        combined_nonmember_scores,
+        args.threshold,
+        threshold_grid,
+    )
+    metrics = {}
+    metrics.update(prefix_metrics("cosine", cosine_metrics))
+    metrics.update(prefix_metrics("loss", loss_metrics))
+    metrics.update(prefix_metrics("combined", combined_metrics))
     elapsed = time.time() - run_start
     LOGGER.info(
-        "run=%03d finished final_acc=%.4f auc=%.4f f1=%.4f tpr=%.4f tnr=%.4f "
-        "best_f1=%.4f best_threshold=%.2f elapsed=%.2fs",
+        "run=%03d finished final_acc=%.4f "
+        "cosine_auc=%.4f cosine_f1=%.4f cosine_best_f1=%.4f cosine_best_threshold=%.2f "
+        "loss_auc=%.4f loss_f1=%.4f loss_best_f1=%.4f loss_best_threshold=%.2f "
+        "combined_auc=%.4f combined_f1=%.4f combined_best_f1=%.4f combined_best_threshold=%.2f "
+        "elapsed=%.2fs",
         run_id,
         final_acc,
-        metrics["auc"],
-        metrics["f1"],
-        metrics["tpr"],
-        metrics["tnr"],
-        metrics["best_f1"],
-        metrics["best_f1_threshold"],
+        metrics["cosine_auc"],
+        metrics["cosine_f1"],
+        metrics["cosine_best_f1"],
+        metrics["cosine_best_f1_threshold"],
+        metrics["loss_auc"],
+        metrics["loss_f1"],
+        metrics["loss_best_f1"],
+        metrics["loss_best_f1_threshold"],
+        metrics["combined_auc"],
+        metrics["combined_f1"],
+        metrics["combined_best_f1"],
+        metrics["combined_best_f1_threshold"],
         elapsed,
     )
     append_jsonl(
@@ -660,7 +862,9 @@ def run_one_trajectory(
             "initial_acc": initial_acc,
             "final_acc": final_acc,
             "elapsed_seconds": elapsed,
-            "threshold_sweep": sweep_rows,
+            "cosine_threshold_sweep": cosine_sweep_rows,
+            "loss_threshold_sweep": loss_sweep_rows,
+            "combined_threshold_sweep": combined_sweep_rows,
             **metrics,
         },
     )
@@ -685,6 +889,7 @@ def build_report(
     total_elapsed: float,
 ) -> str:
     node_types = nx.get_node_attributes(graph, "type")
+    measurement_names = ["cosine", "loss", "combined"]
     metric_names = [
         "tpr",
         "tnr",
@@ -715,6 +920,7 @@ def build_report(
         "Protocol",
         "  Unit of repetition: one full federated BINN training trajectory.",
         "  Membership evidence: target/non-target client updates across communication rounds.",
+        "  Measurement channels: gradient cosine, negative loss, and the average of their FedMIA scores.",
         "  Aggregation: metric mean +/- sample standard deviation across trajectories.",
         f"  fixed_patient_split: {not args.resample_splits}",
         "",
@@ -749,9 +955,12 @@ def build_report(
         "",
         "Aggregated Performance Metrics",
     ]
-    for name in metric_names:
-        mean, std = mean_std([result.metrics[name] for result in results])
-        lines.append(f"  {name}: {mean:.6f} +/- {std:.6f}")
+    for measurement_name in measurement_names:
+        lines.append(f"  [{measurement_name}]")
+        for name in metric_names:
+            metric_key = f"{measurement_name}_{name}"
+            mean, std = mean_std([result.metrics[metric_key] for result in results])
+            lines.append(f"    {name}: {mean:.6f} +/- {std:.6f}")
 
     init_mean, init_std = mean_std([result.initial_acc for result in results])
     final_mean, final_std = mean_std([result.final_acc for result in results])
@@ -768,8 +977,9 @@ def build_report(
     for result in results:
         lines.append(
             f"  run={result.run_id:03d} seed={result.seed} "
-            f"auc={result.metrics['auc']:.6f} f1={result.metrics['f1']:.6f} "
-            f"tpr={result.metrics['tpr']:.6f} tnr={result.metrics['tnr']:.6f} "
+            f"cos_auc={result.metrics['cosine_auc']:.6f} cos_f1={result.metrics['cosine_f1']:.6f} "
+            f"loss_auc={result.metrics['loss_auc']:.6f} loss_f1={result.metrics['loss_f1']:.6f} "
+            f"comb_auc={result.metrics['combined_auc']:.6f} comb_f1={result.metrics['combined_f1']:.6f} "
             f"final_acc={result.final_acc:.6f} elapsed={result.elapsed_seconds:.2f}s"
         )
 
@@ -781,7 +991,7 @@ def build_report(
         )
     else:
         comment = (
-            "Model training reached a usable regime. Compare FedMIA's mean +/- std metrics "
+            "Model training reached a usable regime. Compare each FedMIA measurement channel "
             "with the central BINN/LiRA table while noting the repetition unit is an FL trajectory."
         )
     lines.extend(["", "Commentary", f"  {comment}"])

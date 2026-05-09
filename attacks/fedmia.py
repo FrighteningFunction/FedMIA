@@ -176,18 +176,37 @@ def _estimate_null_distribution(
     reference_measurements: Sequence[Sequence[float]],
     config: FedMIAConfig,
 ) -> Tuple[List[float], List[float]]:
+    """
+    Estimate the paper's Q_out distribution for every candidate sample.
+
+    ``reference_measurements`` is shaped as:
+        reference client x candidate sample
+
+    For each candidate sample, FedMIA treats the non-target clients as the
+    "OUT" population and fits a Gaussian N(mu_out, var_out). Before fitting,
+    the paper removes unusually large reference values with the 3-sigma rule,
+    because a non-target client can occasionally contain the same sample and
+    would then no longer be a clean OUT reference.
+    """
     sample_count = len(reference_measurements[0])
     mu_out: List[float] = []
     var_out: List[float] = []
 
     for sample_idx in range(sample_count):
         sample_values = [row[sample_idx] for row in reference_measurements]
+
+        # Eq. (8)-(9): remove very high reference measurements before fitting
+        # Q_out. High values are suspicious because larger M(I | x,y) means the
+        # update is more aligned with the candidate sample gradient.
         raw_mean = _mean(sample_values)
         raw_std = _std(sample_values, raw_mean)
         cutoff = raw_mean + config.outlier_std_factor * raw_std
         filtered_values = [value for value in sample_values if value <= cutoff]
         if not filtered_values:
             filtered_values = [min(sample_values)]
+
+        # Eq. (10): estimate the OUT Gaussian mean/variance. The variance floor
+        # is a numerical guard for tiny client counts or near-identical updates.
         filtered_mean = _mean(filtered_values)
         filtered_var = max(_variance(filtered_values, filtered_mean), config.min_variance)
         mu_out.append(filtered_mean)
@@ -199,6 +218,10 @@ def score_round(round_measurements: FedMIARoundMeasurements, config: Optional[Fe
     if config is None:
         config = FedMIAConfig()
     mu_out, var_out = _estimate_null_distribution(round_measurements.reference_measurements, config)
+
+    # Eq. (11): score the target update by the Gaussian CDF under Q_out.
+    # A high CDF means the target update's measurement is unusually large
+    # compared with non-target clients, which is member-like for this attack.
     round_scores = [
         normal_cdf(target_value, mu, var)
         for target_value, mu, var in zip(round_measurements.target_measurements, mu_out, var_out)
@@ -228,10 +251,13 @@ def score_rounds(
     sample_count = len(per_round_scores[0])
     aggregate_scores = []
     for sample_idx in range(sample_count):
+        # Eq. (12): combine evidence across communication rounds by averaging
+        # the per-round Lambda scores for the same candidate sample.
         aggregate_scores.append(
             _mean([round_scores[sample_idx] for round_scores in per_round_scores])
         )
 
+    # Algorithm 1: threshold the aggregated score with delta.
     predictions = [1 if score > config.threshold else 0 for score in aggregate_scores]
     return FedMIAScores(
         per_round_scores=per_round_scores,

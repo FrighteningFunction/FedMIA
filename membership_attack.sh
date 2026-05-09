@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Research-grade FedMIA/BINN evaluation.
+# LiRA-style repeated-patient FedMIA/BINN evaluation.
 #
-# The default mirrors the central-model repeated-evaluation idea: evaluate the
-# same patient membership task over many independently initialized federated
-# BINN trajectories. The experiment reports gradient-cosine FedMIA, loss-based
-# FedMIA, and their combined score. Override any knob from the shell, for example:
+# The current default is the next ablation after the 5-client / 10-round
+# baseline: more non-target clients for FedMIA's Qout estimate and more
+# communication rounds for temporal evidence.
 #
 #   RUNS=5 ROUNDS=5 GPU=0 bash membership_attack.sh
 #
 # For a quick plumbing check:
 #
-#   RUNS=1 ROUNDS=1 LOCAL_EPOCHS=1 MAX_SAMPLES=64 FEATURE_LIMIT=2048 DEVICE=cpu bash membership_attack.sh
+#   RUNS=2 ROUNDS=1 LOCAL_EPOCHS=1 AUDIT_COUNT=4 MAX_SAMPLES=64 FEATURE_LIMIT=2048 DEVICE=cpu bash membership_attack.sh
 
 export CUDA_VISIBLE_DEVICES="${GPU:-0}"
 
-python3 -u experiments/fedmia_binn_research.py \
-  --runs "${RUNS:-200}" \
+python3 -u experiments/fedmia_binn_lira_protocol.py \
+  --runs "${RUNS:-10}" \
   --rounds "${ROUNDS:-20}" \
   --local-epochs "${LOCAL_EPOCHS:-2}" \
-  --num-clients "${NUM_CLIENTS:-5}" \
+  --num-clients "${NUM_CLIENTS:-10}" \
   --samples-per-client "${SAMPLES_PER_CLIENT:-64}" \
-  --candidate-count "${CANDIDATE_COUNT:-32}" \
+  --audit-count "${AUDIT_COUNT:-32}" \
+  --inclusion-prob "${INCLUSION_PROB:-0.5}" \
   --batch-size "${BATCH_SIZE:-16}" \
   --lr "${LR:-0.03}" \
   --threshold "${THRESHOLD:-0.5}" \

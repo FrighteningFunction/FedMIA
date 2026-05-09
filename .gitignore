@@ -8,6 +8,10 @@ attack_logs
 **.venv
 **__pycache__**
 
+# data
+data
+reports
+
 # Miscellaneous
 BINN-and-LiRA
 fedmia.pdf

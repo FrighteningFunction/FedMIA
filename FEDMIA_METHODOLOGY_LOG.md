@@ -268,3 +268,67 @@ Dry run:
 ```bash
 RUNS=2 ROUND_GRID="2 3" LOCAL_EPOCHS=1 NUM_CLIENTS=5 AUDIT_COUNT=4 SAMPLES_PER_CLIENT=4 BATCH_SIZE=4 MAX_SAMPLES=64 FEATURE_LIMIT=512 DEVICE=cpu bash membership_attack_round_grid.sh
 ```
+
+Implementation note:
+
+- The first full 10-client grid attempt exposed a FedAvg bug in `utils/federated.py`.
+- The old averaging function averaged every state-dict entry, including integer sparse-graph buffers such as `_sparse_sizes_1`.
+- With 10 clients, fractional averaging could turn an integer buffer like `11486` into `11485.999...`; loading it back into a long tensor truncated it to `11485`.
+- That caused the full Reactome model to crash with:
+  - `Expected dim 0 size 11485, got 11486`
+- Fix:
+  - FedAvg now averages only floating-point tensors.
+  - Non-floating structural buffers are copied unchanged from the first local model.
+- Validation:
+  - full Reactome model sparse sizes remain unchanged after 10-client FedAvg.
+  - a tiny 10-client CPU training pass completed successfully.
+
+## 7. Switch Away From Round Grid
+
+Reason:
+
+- The completed 20-round / 10-client grid cell showed that the model trains
+  properly, but attack strength stayed close to the earlier baseline:
+  - final accuracy around `0.803`
+  - patient mean AUC around `0.674`
+  - patient mean F1 around `0.64`
+  - FPR around `0.44-0.49` at the default `delta=0.5`
+- The old `SAMPLES_PER_CLIENT=64` setting was inherited from smoke-test work.
+  With `NUM_CLIENTS=10`, that trains on about `640` patient slots, while the
+  prostate dataset has `1012` patients.
+- For the current audited protocol, `AUDIT_COUNT=32`, leaving about `980`
+  non-audited background patients. With `NUM_CLIENTS=10`, a near-full balanced
+  allocation is therefore approximately `98` background patients per client.
+
+Decision:
+
+- Stop treating the round grid as the default path.
+- Use one serious high-round experiment through `membership_attack.sh`.
+- Keep `membership_attack_round_grid.sh` only for explicit future ablations.
+
+Current primary command:
+
+```bash
+GPU=0 bash membership_attack.sh
+```
+
+Current primary defaults:
+
+- `RUNS=30`
+- `ROUNDS=100`
+- `LOCAL_EPOCHS=2`
+- `NUM_CLIENTS=10`
+- `SAMPLES_PER_CLIENT=98`
+- `AUDIT_COUNT=32`
+- `INCLUSION_PROB=0.5`
+
+Expected tradeoff:
+
+- This is much slower than the smoke-test settings, but it is more comparable
+  to the central BINN membership evaluation because it uses almost the full
+  available patient background per trajectory and gives FedMIA many
+  communication rounds to aggregate.
+- Larger client datasets can dilute each audited patient's contribution to a
+  single client update, so stronger model accuracy does not guarantee stronger
+  membership inference. The result should be interpreted through AUC, F1,
+  TPR/TNR, FPR, and low-FPR TPR rather than global accuracy alone.

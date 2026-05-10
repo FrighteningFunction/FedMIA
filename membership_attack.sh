@@ -3,11 +3,16 @@ set -euo pipefail
 
 # LiRA-style repeated-patient FedMIA/BINN evaluation.
 #
-# The current default is the next ablation after the 5-client / 10-round
-# baseline: more non-target clients for FedMIA's Qout estimate and more
-# communication rounds for temporal evidence.
+# Current default: one serious, non-grid experiment. We use many communication
+# rounds because FedMIA aggregates evidence over the trajectory, and we use
+# near-full background sampling for the prostate dataset instead of the old
+# 64-sample smoke-test setting.
 #
-#   RUNS=5 ROUNDS=5 GPU=0 bash membership_attack.sh
+#   GPU=0 bash membership_attack.sh
+#
+# Faster exploratory variant:
+#
+#   RUNS=10 ROUNDS=50 GPU=0 bash membership_attack.sh
 #
 # For a quick plumbing check:
 #
@@ -16,11 +21,11 @@ set -euo pipefail
 export CUDA_VISIBLE_DEVICES="${GPU:-0}"
 
 python3 -u experiments/fedmia_binn_lira_protocol.py \
-  --runs "${RUNS:-10}" \
-  --rounds "${ROUNDS:-20}" \
+  --runs "${RUNS:-30}" \
+  --rounds "${ROUNDS:-100}" \
   --local-epochs "${LOCAL_EPOCHS:-2}" \
   --num-clients "${NUM_CLIENTS:-10}" \
-  --samples-per-client "${SAMPLES_PER_CLIENT:-64}" \
+  --samples-per-client "${SAMPLES_PER_CLIENT:-98}" \
   --audit-count "${AUDIT_COUNT:-32}" \
   --inclusion-prob "${INCLUSION_PROB:-0.5}" \
   --batch-size "${BATCH_SIZE:-16}" \

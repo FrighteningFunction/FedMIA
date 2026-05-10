@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Sequential round-grid runner for the LiRA-style FedMIA/BINN protocol.
+# Optional sequential round-grid runner for the LiRA-style FedMIA/BINN protocol.
+# The main launcher (`membership_attack.sh`) is now the preferred path for the
+# serious run; this script is kept for explicit ablations only.
 #
 # Default grid:
 #   ROUNDS=20  LOCAL_EPOCHS=2
 #   ROUNDS=50  LOCAL_EPOCHS=2
 #   ROUNDS=100 LOCAL_EPOCHS=2
 #
-# Defaults are intentionally more serious than a smoke test:
-#   RUNS=30, NUM_CLIENTS=10, AUDIT_COUNT=32
+# Defaults match the serious protocol except for the explicit round sweep:
+#   RUNS=30, NUM_CLIENTS=10, AUDIT_COUNT=32, SAMPLES_PER_CLIENT=98
 #
 # Quick dry run:
 #   RUNS=2 ROUND_GRID="2 3" LOCAL_EPOCHS=1 NUM_CLIENTS=5 AUDIT_COUNT=4 SAMPLES_PER_CLIENT=4 BATCH_SIZE=4 MAX_SAMPLES=64 FEATURE_LIMIT=512 DEVICE=cpu bash membership_attack_round_grid.sh
@@ -21,7 +23,7 @@ ROUND_GRID="${ROUND_GRID:-20 50 100}"
 LOCAL_EPOCHS="${LOCAL_EPOCHS:-2}"
 NUM_CLIENTS="${NUM_CLIENTS:-10}"
 AUDIT_COUNT="${AUDIT_COUNT:-32}"
-SAMPLES_PER_CLIENT="${SAMPLES_PER_CLIENT:-64}"
+SAMPLES_PER_CLIENT="${SAMPLES_PER_CLIENT:-98}"
 
 echo "FedMIA BINN round grid"
 echo "  RUNS=${RUNS}"

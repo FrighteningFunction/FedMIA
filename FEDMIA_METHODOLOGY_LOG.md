@@ -1,6 +1,6 @@
 # FedMIA BINN Methodology Log
 
-Date: 2026-05-09
+Date: 2026-05-09-
 
 This note tracks the attack methodology changes made during the BINN/FedMIA evaluation work. It is intentionally kept at the repository root so it can serve as the human-readable source of truth for the experiment history.
 
@@ -83,19 +83,13 @@ Observed issue:
   - `combined_best_f1` about `0.681`
 - Since `F1 = 0.667` is close to the "predict almost everything as IN" baseline for balanced membership data, this was not strong evidence of a meaningful attack.
 
-Why this was not comparable to the central BINN report:
-
-- It attacked a fixed member cohort against a fixed holdout cohort.
-- It did not repeatedly flip the same patient between IN and OUT across models.
-- It did not create patient-specific IN/OUT distributions like LiRA.
-- It estimated `Qout` from only the non-target clients inside each communication round.
-
 Conclusion:
 
 - Useful as a FedMIA paper-style pilot.
-- Not the right protocol for comparison with the central BINN LiRA table.
 
 ## 4. New Runner: LiRA-Style Repeated-Patient FedMIA
+
+This concept was inspired by the central BINN's evaluation method, but the concept itself does not pass the original method of FedMIA itself according to the paper. Therefore this concept was deemed ineffective dead end.
 
 File: `experiments/fedmia_binn_lira_protocol.py`
 
@@ -196,7 +190,6 @@ Result summary:
 
 Interpretation:
 
-- The patient-wise protocol is working and is more scientifically defensible than the earlier fixed-cohort split.
 - The current 5-client setup likely underestimates FedMIA because `Qout` is estimated from only 4 non-target clients per round.
 - The current 10-round setup may also dilute temporal signal because early noisy rounds are averaged equally with later rounds.
 - Increasing `AUDIT_COUNT` would make the audit more representative, but it should not be the first lever for attack strength.
@@ -213,18 +206,6 @@ Tweaks added after this run:
   - `LOCAL_EPOCHS=2`
   - `NUM_CLIENTS=10`
   - `AUDIT_COUNT=32`
-
-Next recommended ablation:
-
-```bash
-RUNS=10 ROUNDS=20 LOCAL_EPOCHS=2 NUM_CLIENTS=10 AUDIT_COUNT=32 GPU=0 bash membership_attack.sh
-```
-
-If this improves AUC/F1, the likely bottleneck was the small number of non-target reference clients and short temporal evidence. If it does not, test local memorization pressure:
-
-```bash
-RUNS=10 ROUNDS=10 LOCAL_EPOCHS=5 NUM_CLIENTS=5 AUDIT_COUNT=32 GPU=0 bash membership_attack.sh
-```
 
 ## 6. Round Grid Plan
 
@@ -262,26 +243,6 @@ What to inspect:
 - all-round metrics versus `last_half` and `last_quarter` diagnostics.
 - whether patient mean AUC/F1 improves monotonically from 20 to 50 to 100 rounds.
 - whether low-FPR TPR improves, especially `tpr_at_fpr_0.1` and `tpr_at_fpr_0.01`.
-
-Dry run:
-
-```bash
-RUNS=2 ROUND_GRID="2 3" LOCAL_EPOCHS=1 NUM_CLIENTS=5 AUDIT_COUNT=4 SAMPLES_PER_CLIENT=4 BATCH_SIZE=4 MAX_SAMPLES=64 FEATURE_LIMIT=512 DEVICE=cpu bash membership_attack_round_grid.sh
-```
-
-Implementation note:
-
-- The first full 10-client grid attempt exposed a FedAvg bug in `utils/federated.py`.
-- The old averaging function averaged every state-dict entry, including integer sparse-graph buffers such as `_sparse_sizes_1`.
-- With 10 clients, fractional averaging could turn an integer buffer like `11486` into `11485.999...`; loading it back into a long tensor truncated it to `11485`.
-- That caused the full Reactome model to crash with:
-  - `Expected dim 0 size 11485, got 11486`
-- Fix:
-  - FedAvg now averages only floating-point tensors.
-  - Non-floating structural buffers are copied unchanged from the first local model.
-- Validation:
-  - full Reactome model sparse sizes remain unchanged after 10-client FedAvg.
-  - a tiny 10-client CPU training pass completed successfully.
 
 ## 7. Switch Away From Round Grid
 
@@ -322,13 +283,114 @@ Current primary defaults:
 - `AUDIT_COUNT=32`
 - `INCLUSION_PROB=0.5`
 
-Expected tradeoff:
+## 8. Switch back to FedMIA Paper-Style Baseline
 
-- This is much slower than the smoke-test settings, but it is more comparable
-  to the central BINN membership evaluation because it uses almost the full
-  available patient background per trajectory and gives FedMIA many
-  communication rounds to aggregate.
-- Larger client datasets can dilute each audited patient's contribution to a
-  single client update, so stronger model accuracy does not guarantee stronger
-  membership inference. The result should be interpreted through AUC, F1,
-  TPR/TNR, FPR, and low-FPR TPR rather than global accuracy alone.
+Reason:
+
+- The "LiRA-style" repeated-patient protocol is not the FedMIA paper protocol.
+- The baseline we need now is a direct FedMIA-style FL experiment:
+  - horizontal FedAvg,
+  - one target client,
+  - non-target client updates estimate `Qout`,
+  - FedMIA-I uses loss measurement,
+  - FedMIA-II uses gradient-cosine measurement,
+  - metrics prioritize AUC and TPR@low FPR.
+- No LiRA/shadow-model membership matrix is used in this baseline.
+
+Implementation:
+
+- New script: `experiments/fedmia_binn_paper_grid.py`
+- Main launcher: `membership_attack.sh`
+- Logs:
+  - `logs/fedmia_binn_paper_grid_<date>_<id>.log`
+  - `logs/fedmia_binn_paper_grid_<date>_<id>.jsonl`
+- Reports:
+  - `reports/fedmia_binn_paper_grid_<date>_<id>.txt`
+  - `reports/fedmia_binn_paper_grid_<date>_<id>.csv`
+
+Paper settings represented by the grid:
+
+- client count grid: paper evaluates `5-30` clients.
+- communication rounds: paper defaults to `300` synchronous rounds.
+- local epochs: paper varies `1-9`.
+- Non-IID extent: paper uses Dirichlet `beta = 0.1, 1, 10, infinity`; `infinity` is `iid`.
+- sample volume: paper varies samples per client, but BINN has only `1012`
+  prostate patients. Therefore the script translates sample count to the
+  maximum disjoint patient records per client after the paper's one-tenth
+  holdout.
+
+Exact BINN sample-count translation:
+
+- total patients: `1012`
+- one-tenth stratified holdout: `101`
+- FL training pool: `911`
+- max disjoint samples/client:
+  - `5` clients: `182`
+  - `10` clients: `91`
+  - `20` clients: `45`
+  - `30` clients: `30`
+
+The default script setting uses `samples_per_client_grid=auto`, which means:
+
+- compute `floor(train_pool / clients)` for each client count,
+- use `sample_fraction_grid` to choose a fraction of that maximum,
+- default `sample_fraction_grid=1.0`, i.e. use the full available BINN client
+  sample volume for that client count.
+
+Plumbing check:
+
+```bash
+PLUMBING=1 bash membership_attack.sh
+```
+
+Result:
+
+- passed end-to-end on real pnet data and a capped real Reactome DAG.
+- report:
+  - `reports/fedmia_binn_paper_grid_2026-05-10-10-26_8536e955.txt`
+- log:
+  - `logs/fedmia_binn_paper_grid_2026-05-10-10-26_8536e955.log`
+- CSV:
+  - `reports/fedmia_binn_paper_grid_2026-05-10-10-26_8536e955.csv`
+
+Recommended first serious baseline:
+
+```bash
+RUNS=30 CLIENT_GRID=10 ROUND_GRID=300 LOCAL_EPOCH_GRID=1 BETA_GRID=iid SAMPLE_FRACTION_GRID=1.0 GPU=0 bash membership_attack.sh
+```
+
+Recommended paper ablation grid after the baseline:
+
+```bash
+RUNS=5 CLIENT_GRID="5,10,20,30" ROUND_GRID="100,200,300" LOCAL_EPOCH_GRID="1,3,5,9" BETA_GRID="iid,10,1,0.1" SAMPLE_FRACTION_GRID="1.0" GPU=0 bash membership_attack.sh
+```
+
+This grid is intentionally expensive. It follows the paper's axes, but the
+number of repetitions should be selected based on available GPU time.
+
+## 9. Fix
+
+The implementation above selected non-members incorrectly, and the 300 round runs were probably causing gradient collapse for the model. The next run will be run with the following configuration:
+
+```bash
+RUNS=1 CLIENT_GRID="10" ROUND_GRID="10" LOCAL_EPOCH_GRID="2" BETA_GRID="iid" SAMPLE_FRACTION_GRID="1.0" GPU=0 bash membership_attack.sh
+```
+
+this resulted with:
+fedmia_binn_paper_grid_2026-05-11-07-34_8617e73d.txt
+
+train_acc_final=0.753846 +/- 0.000000
+    holdout_acc_final=0.792079 +/- 0.000000
+    FedMIA-I loss auc=0.617679 +/- 0.000000 f1=0.546512 +/- 0.000000 tpr@fpr0.001=0.065934
+    FedMIA-I pooled auc=0.617679 f1=0.546512 tpr=0.516484 tnr=0.626374 fpr=0.373626 tpr@fpr0.001=0.065934
+    FedMIA-II cosine auc=0.608622 +/- 0.000000 f1=0.535714 +/- 0.000000 tpr@fpr0.001=0.000000
+    FedMIA-II pooled auc=0.608622 f1=0.535714 tpr=0.494505 tnr=0.648352 fpr=0.351648 tpr@fpr0.001=0.000000
+
+## 10. Increase rounds
+
+```bash
+RUNS=1 CLIENT_GRID="10" ROUND_GRID="100" LOCAL_EPOCH_GRID="2" BETA_GRID="iid" SAMPLE_FRACTION_GRID="1.0" GPU=0 bash membership_attack.sh
+```
+
+
+

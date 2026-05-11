@@ -368,6 +368,82 @@ RUNS=5 CLIENT_GRID="5,10,20,30" ROUND_GRID="100,200,300" LOCAL_EPOCH_GRID="1,3,5
 This grid is intentionally expensive. It follows the paper's axes, but the
 number of repetitions should be selected based on available GPU time.
 
+## 9. FedMIA AlexNet/CIFAR100 Reproduction
+
+Reason:
+
+- We need a direct reproduction of the FedMIA paper setting before comparing
+  FedMIA behavior on BINN.
+- This is separate from the BINN runner and separate from all LiRA-style work.
+
+Implementation:
+
+- New script: `experiments/fedmia_cifar100_alexnet_grid.py`
+- Launcher: `membership_attack_cifar100.sh`
+- Model: repo `models/alexnet.py` with `num_classes=100`
+- Dataset: official CIFAR100 Python archive under
+  `data/datasets/CIFAR100/cifar-100-python`
+- If the dataset is not present, run with `DOWNLOAD=1` to fetch the official
+  archive.
+
+FedMIA mapping:
+
+- FedMIA-I:
+  - negative cross-entropy loss measurement.
+- FedMIA-II:
+  - gradient-cosine measurement from Eq. (7).
+- Target client:
+  - client `0`.
+- `Qout`:
+  - estimated from non-target client updates in each communication round.
+- FL:
+  - FedAvg.
+  - SGD.
+  - initial learning rate `0.1`.
+  - learning-rate decay `0.99` per communication round.
+
+Default requested grid:
+
+```bash
+RUNS=10 CLIENT_GRID="5,10" ROUND_GRID="100,200,300" LOCAL_EPOCH_GRID="1,3,5" BETA_GRID="iid,10,1,0.1" SAMPLE_FRACTION_GRID=1.0 GPU=0 bash membership_attack_cifar100.sh
+```
+
+This means:
+
+- `10` independent trajectories per grid cell.
+- clients: `5` and `10`.
+- communication rounds: `100`, `200`, `300`.
+- local epochs: `1`, `3`, `5`.
+- data splits: IID and Dirichlet beta `10`, `1`, `0.1`.
+- auto sample counts:
+  - `5` clients -> `10000` CIFAR100 training samples/client.
+  - `10` clients -> `5000` CIFAR100 training samples/client.
+
+Candidate-count note:
+
+- Training samples/client follows the paper's FL scale.
+- Attack candidate count controls how many target-client member examples and
+  nonmember examples are scored with FedMIA.
+- The default is `CANDIDATE_COUNT=512` because FedMIA-II requires per-sample
+  gradients and is expensive over 300 rounds. Increase it for final runs if GPU
+  time allows.
+
+Plumbing check:
+
+```bash
+PLUMBING=1 bash membership_attack_cifar100.sh
+```
+
+Result:
+
+- Passed end-to-end using synthetic CIFAR-shaped tensors for wiring only.
+- This is not a scientific result and should not be compared to the paper.
+- Artifacts:
+  - `reports/fedmia_cifar100_alexnet_2026-05-11-20-16_9955e0a8.txt`
+  - `reports/fedmia_cifar100_alexnet_2026-05-11-20-16_9955e0a8.csv`
+  - `logs/fedmia_cifar100_alexnet_2026-05-11-20-16_9955e0a8.log`
+  - `logs/fedmia_cifar100_alexnet_2026-05-11-20-16_9955e0a8.jsonl`
+
 ## 9. Fix
 
 The implementation above selected non-members incorrectly, and the 300 round runs were probably causing gradient collapse for the model. The next run will be run with the following configuration:
@@ -392,5 +468,30 @@ train_acc_final=0.753846 +/- 0.000000
 RUNS=1 CLIENT_GRID="10" ROUND_GRID="100" LOCAL_EPOCH_GRID="2" BETA_GRID="iid" SAMPLE_FRACTION_GRID="1.0" GPU=0 bash membership_attack.sh
 ```
 
+## 11. Test attack on cifar100 alexnet
 
+Reproduce original fedmia papers results to confirm repository code correctness.
 
+```bash
+DOWNLOAD=1 GPU=0 bash membership_attack_cifar100.sh
+```
+
+Remote DOWNLOAD=1 to skip downloading CIFAR100 into data/datasets.
+
+This uses the following default values:
+
+```text
+RUNS_DEFAULT=10
+  CLIENT_GRID_DEFAULT="5,10"
+  ROUND_GRID_DEFAULT="100,200,300"
+  LOCAL_EPOCH_GRID_DEFAULT="1,3,5"
+  BETA_GRID_DEFAULT="iid,10,1,0.1"
+  SAMPLE_FRACTION_GRID_DEFAULT=1.0
+  SAMPLES_PER_CLIENT_GRID_DEFAULT=auto
+  CANDIDATE_COUNT_DEFAULT=512
+  MAX_TRAIN_SAMPLES_DEFAULT=0
+  MAX_TEST_SAMPLES_DEFAULT=0
+  MAX_CONFIGS_DEFAULT=0
+  DEVICE_DEFAULT=cuda
+  SYNTHETIC_FLAG_DEFAULT=0
+  ```

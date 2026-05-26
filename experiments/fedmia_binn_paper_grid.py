@@ -5,6 +5,7 @@ import copy
 import csv
 import json
 import logging
+import math
 import os
 import random
 import sys
@@ -61,6 +62,8 @@ class TrajectoryResult:
     metrics: Dict[str, float]
     member_scores: Dict[str, List[float]]
     nonmember_scores: Dict[str, List[float]]
+    member_indices: List[int]
+    nonmember_indices: List[int]
 
 
 def parse_args():
@@ -96,7 +99,7 @@ def parse_args():
         "--candidate-count",
         type=int,
         default=0,
-        help="candidate members/nonmembers per run; 0 uses all target-client samples",
+        help="candidate members/nonmembers per run; 0 uses the largest balanced target-client/holdout set",
     )
     parser.add_argument("--batch-size", type=int, default=16, help="local training batch size")
     parser.add_argument("--lr", type=float, default=0.03, help="local optimizer learning rate")
@@ -302,9 +305,17 @@ def make_client_indices(labels, train_indices, config: GridConfig, rng) -> List[
 
 def make_candidate_indices(labels, client_indices, holdout_indices, candidate_count: int, rng):
     target_pool = list(client_indices[0])
-    member_count = len(target_pool) if candidate_count <= 0 else min(candidate_count, len(target_pool))
-    member_indices = balanced_draw(labels, member_count, rng, target_pool)
     nonmember_pool = list(holdout_indices)
+    max_balanced_count = min(len(target_pool), len(nonmember_pool))
+    member_count = max_balanced_count if candidate_count <= 0 else min(candidate_count, max_balanced_count)
+    if member_count < len(target_pool) and candidate_count <= 0:
+        LOGGER.info(
+            "Capping attack candidates to %s because target client has %s samples and holdout has %s.",
+            member_count,
+            len(target_pool),
+            len(nonmember_pool),
+        )
+    member_indices = balanced_draw(labels, member_count, rng, target_pool)
     nonmember_indices = balanced_draw(labels, member_count, rng, nonmember_pool)
     return member_indices, nonmember_indices
 
@@ -621,6 +632,8 @@ def run_one_trajectory(
             "fedmia_i_loss": loss_evaluation.nonmember_scores.aggregate_scores,
             "fedmia_ii_cosine": cosine_evaluation.nonmember_scores.aggregate_scores,
         },
+        member_indices=[int(idx) for idx in member_indices],
+        nonmember_indices=[int(idx) for idx in nonmember_indices],
     )
 
 
@@ -648,6 +661,255 @@ def pooled_metrics(results: Sequence[TrajectoryResult], measurement: str, args) 
     metrics["member_count"] = float(len(member_scores))
     metrics["nonmember_count"] = float(len(nonmember_scores))
     return metrics
+
+
+def auc_contribution_for_members(member_scores: Sequence[float], nonmember_scores: Sequence[float]) -> List[float]:
+    contributions = []
+    for member_score in member_scores:
+        wins = sum(1.0 for score in nonmember_scores if member_score > score)
+        ties = sum(1.0 for score in nonmember_scores if member_score == score)
+        contributions.append((wins + 0.5 * ties) / max(len(nonmember_scores), 1))
+    return contributions
+
+
+def auc_contribution_for_nonmembers(member_scores: Sequence[float], nonmember_scores: Sequence[float]) -> List[float]:
+    contributions = []
+    for nonmember_score in nonmember_scores:
+        wins = sum(1.0 for score in member_scores if score > nonmember_score)
+        ties = sum(1.0 for score in member_scores if score == nonmember_score)
+        contributions.append((wins + 0.5 * ties) / max(len(member_scores), 1))
+    return contributions
+
+
+def safe_mean(values: Sequence[float]) -> float:
+    clean_values = [float(value) for value in values if not math.isnan(float(value))]
+    if not clean_values:
+        return float("nan")
+    return float(np.mean(clean_values))
+
+
+def safe_sample_std(values: Sequence[float]) -> float:
+    clean_values = [float(value) for value in values if not math.isnan(float(value))]
+    if len(clean_values) <= 1:
+        return 0.0
+    return float(np.std(clean_values, ddof=1))
+
+
+def make_patient_observation_rows(results: Sequence[TrajectoryResult], args, y) -> List[Dict[str, float]]:
+    rows: List[Dict[str, float]] = []
+    for result in results:
+        for measurement in ("fedmia_i_loss", "fedmia_ii_cosine"):
+            member_scores = result.member_scores[measurement]
+            nonmember_scores = result.nonmember_scores[measurement]
+            member_auc_parts = auc_contribution_for_members(member_scores, nonmember_scores)
+            nonmember_auc_parts = auc_contribution_for_nonmembers(member_scores, nonmember_scores)
+            for patient_index, score, auc_part in zip(
+                result.member_indices, member_scores, member_auc_parts
+            ):
+                prediction = 1 if score > args.threshold else 0
+                rows.append(
+                    {
+                        "config_id": result.config.config_id,
+                        "run": result.run_id,
+                        "seed": result.seed,
+                        "measurement": measurement,
+                        "patient_index": int(patient_index),
+                        "class_label": int(y[patient_index].item()),
+                        "membership_label": 1,
+                        "prediction": prediction,
+                        "correct": 1 if prediction == 1 else 0,
+                        "score": float(score),
+                        "auc_contribution": float(auc_part),
+                    }
+                )
+            for patient_index, score, auc_part in zip(
+                result.nonmember_indices, nonmember_scores, nonmember_auc_parts
+            ):
+                prediction = 1 if score > args.threshold else 0
+                rows.append(
+                    {
+                        "config_id": result.config.config_id,
+                        "run": result.run_id,
+                        "seed": result.seed,
+                        "measurement": measurement,
+                        "patient_index": int(patient_index),
+                        "class_label": int(y[patient_index].item()),
+                        "membership_label": 0,
+                        "prediction": prediction,
+                        "correct": 1 if prediction == 0 else 0,
+                        "score": float(score),
+                        "auc_contribution": float(auc_part),
+                    }
+                )
+    return rows
+
+
+def patient_f1(tp: int, fp: int, fn: int) -> float:
+    if tp + fn == 0:
+        return float("nan")
+    precision = tp / (tp + fp) if tp + fp > 0 else 0.0
+    recall = tp / max(tp + fn, 1)
+    if precision + recall <= 0.0:
+        return 0.0
+    return 2.0 * precision * recall / (precision + recall)
+
+
+def patient_auc(member_scores: Sequence[float], nonmember_scores: Sequence[float]) -> float:
+    if not member_scores or not nonmember_scores:
+        return float("nan")
+    fprs, tprs = research.roc_curve_from_scores(member_scores, nonmember_scores)
+    return research.trapezoid_auc(fprs, tprs)
+
+
+def make_patient_metric_rows(observation_rows: Sequence[Dict[str, float]]) -> List[Dict[str, float]]:
+    grouped: Dict[Tuple[int, str, int], List[Dict[str, float]]] = {}
+    for row in observation_rows:
+        key = (int(row["config_id"]), str(row["measurement"]), int(row["patient_index"]))
+        grouped.setdefault(key, []).append(row)
+
+    metric_rows: List[Dict[str, float]] = []
+    for (config_id, measurement, patient_index), rows in sorted(grouped.items()):
+        member_rows = [row for row in rows if int(row["membership_label"]) == 1]
+        nonmember_rows = [row for row in rows if int(row["membership_label"]) == 0]
+        tp = sum(1 for row in member_rows if int(row["prediction"]) == 1)
+        fn = len(member_rows) - tp
+        tn = sum(1 for row in nonmember_rows if int(row["prediction"]) == 0)
+        fp = len(nonmember_rows) - tn
+        member_scores = [float(row["score"]) for row in member_rows]
+        nonmember_scores = [float(row["score"]) for row in nonmember_rows]
+        member_auc_parts = [float(row["auc_contribution"]) for row in member_rows]
+        nonmember_auc_parts = [float(row["auc_contribution"]) for row in nonmember_rows]
+        all_scores = [float(row["score"]) for row in rows]
+        all_auc_parts = [float(row["auc_contribution"]) for row in rows]
+        metric_rows.append(
+            {
+                "config_id": config_id,
+                "measurement": measurement,
+                "patient_index": patient_index,
+                "class_label": int(rows[0]["class_label"]),
+                "appearances": len(rows),
+                "member_appearances": len(member_rows),
+                "nonmember_appearances": len(nonmember_rows),
+                "true_positives_when_member": tp,
+                "false_negatives_when_member": fn,
+                "true_negatives_when_nonmember": tn,
+                "false_positives_when_nonmember": fp,
+                "member_correct_rate": tp / len(member_rows) if member_rows else float("nan"),
+                "nonmember_correct_rate": tn / len(nonmember_rows) if nonmember_rows else float("nan"),
+                "nonmember_false_positive_rate": fp / len(nonmember_rows) if nonmember_rows else float("nan"),
+                "threshold_accuracy": (tp + tn) / max(len(rows), 1),
+                "f1": patient_f1(tp, fp, fn),
+                "auc": patient_auc(member_scores, nonmember_scores),
+                "has_both_membership_states": 1 if member_rows and nonmember_rows else 0,
+                "score_mean": safe_mean(all_scores),
+                "score_std": safe_sample_std(all_scores),
+                "member_score_mean": safe_mean(member_scores),
+                "nonmember_score_mean": safe_mean(nonmember_scores),
+                "auc_contribution_mean": safe_mean(all_auc_parts),
+                "member_auc_contribution_mean": safe_mean(member_auc_parts),
+                "nonmember_auc_contribution_mean": safe_mean(nonmember_auc_parts),
+            }
+        )
+    return metric_rows
+
+
+def format_patient_value(value) -> str:
+    if isinstance(value, float) and math.isnan(value):
+        return "nan"
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    return str(value)
+
+
+def write_patient_report(
+    path: str,
+    experiment_id: str,
+    observation_csv_path: str,
+    patient_csv_path: str,
+    patient_rows: Sequence[Dict[str, float]],
+):
+    lines = [
+        "FedMIA BINN Patient-Level Metrics Report",
+        f"experiment_id: {experiment_id}",
+        f"patient_observation_csv_file: {os.path.relpath(observation_csv_path, REPO_ROOT)}",
+        f"patient_metrics_csv_file: {os.path.relpath(patient_csv_path, REPO_ROOT)}",
+        "",
+        "Interpretation",
+        "  auc is defined only when the same patient appears as both IN and OUT across runs.",
+        "  auc_contribution_mean is available for every attacked patient and measures that patient's",
+        "  pairwise contribution to the global AUC in the runs where it appeared.",
+        "  member_correct_rate is the rate of correct IN predictions when the patient was a member.",
+        "  nonmember_correct_rate is the rate of correct OUT predictions when the patient was a nonmember.",
+        "",
+    ]
+    for measurement in ("fedmia_i_loss", "fedmia_ii_cosine"):
+        rows = [row for row in patient_rows if row["measurement"] == measurement]
+        both_rows = [row for row in rows if int(row["has_both_membership_states"]) == 1]
+        lines.extend(
+            [
+                f"{measurement}",
+                f"  patients_observed: {len(rows)}",
+                f"  patients_with_both_in_and_out_states: {len(both_rows)}",
+                "  Top member leakage cases",
+            ]
+        )
+        member_rows = [
+            row for row in rows if int(row["member_appearances"]) > 0
+        ]
+        member_rows.sort(
+            key=lambda row: (
+                -float(row["member_correct_rate"]) if not math.isnan(float(row["member_correct_rate"])) else 1.0,
+                -float(row["member_auc_contribution_mean"]) if not math.isnan(float(row["member_auc_contribution_mean"])) else 1.0,
+                -float(row["member_score_mean"]) if not math.isnan(float(row["member_score_mean"])) else 1.0,
+            )
+        )
+        for row in member_rows[:10]:
+            lines.append(
+                "    "
+                f"patient={row['patient_index']} class_label={row['class_label']} "
+                f"member_n={row['member_appearances']} "
+                f"member_correct_rate={format_patient_value(row['member_correct_rate'])} "
+                f"member_auc_contribution={format_patient_value(row['member_auc_contribution_mean'])} "
+                f"member_score_mean={format_patient_value(row['member_score_mean'])} "
+                f"f1={format_patient_value(row['f1'])}"
+            )
+        lines.append("  Top nonmember false-positive cases")
+        nonmember_rows = [
+            row for row in rows if int(row["nonmember_appearances"]) > 0
+        ]
+        nonmember_rows.sort(
+            key=lambda row: (
+                -float(row["nonmember_false_positive_rate"])
+                if not math.isnan(float(row["nonmember_false_positive_rate"]))
+                else 1.0,
+                -float(row["nonmember_score_mean"]) if not math.isnan(float(row["nonmember_score_mean"])) else 1.0,
+            )
+        )
+        for row in nonmember_rows[:10]:
+            lines.append(
+                "    "
+                f"patient={row['patient_index']} class_label={row['class_label']} "
+                f"nonmember_n={row['nonmember_appearances']} "
+                f"false_positive_rate={format_patient_value(row['nonmember_false_positive_rate'])} "
+                f"nonmember_correct_rate={format_patient_value(row['nonmember_correct_rate'])} "
+                f"nonmember_auc_contribution={format_patient_value(row['nonmember_auc_contribution_mean'])} "
+                f"nonmember_score_mean={format_patient_value(row['nonmember_score_mean'])}"
+            )
+        lines.append("  Patients with per-patient AUC available")
+        both_rows.sort(key=lambda row: -float(row["auc"]))
+        for row in both_rows[:10]:
+            lines.append(
+                "    "
+                f"patient={row['patient_index']} class_label={row['class_label']} "
+                f"auc={format_patient_value(row['auc'])} "
+                f"f1={format_patient_value(row['f1'])} "
+                f"member_n={row['member_appearances']} "
+                f"nonmember_n={row['nonmember_appearances']}"
+            )
+        lines.append("")
+    rendered = "\n".join(lines)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(rendered + "\n")
 
 
 def summarize_config(results: Sequence[TrajectoryResult], args) -> Dict[str, float]:
@@ -752,6 +1014,9 @@ def write_report(
     log_path: str,
     jsonl_path: str,
     csv_path: str,
+    patient_observation_csv_path: str,
+    patient_metrics_csv_path: str,
+    patient_report_path: str,
     args,
     data_summary: Dict,
     config_rows: Sequence[Dict],
@@ -764,6 +1029,9 @@ def write_report(
         f"log_file: {os.path.relpath(log_path, REPO_ROOT)}",
         f"jsonl_log_file: {os.path.relpath(jsonl_path, REPO_ROOT)}",
         f"csv_file: {os.path.relpath(csv_path, REPO_ROOT)}",
+        f"patient_observation_csv_file: {os.path.relpath(patient_observation_csv_path, REPO_ROOT)}",
+        f"patient_metrics_csv_file: {os.path.relpath(patient_metrics_csv_path, REPO_ROOT)}",
+        f"patient_metrics_report_file: {os.path.relpath(patient_report_path, REPO_ROOT)}",
         "",
         "Protocol",
         "  Baseline follows FedMIA's FL setup, not the earlier LiRA-style shadow protocol.",
@@ -771,7 +1039,8 @@ def write_report(
         "  Qout estimate: non-target client updates in the same communication round.",
         "  FedMIA-I: negative model loss measurement.",
         "  FedMIA-II: gradient-cosine measurement from Eq. (7).",
-        "  Nonmembers: one-tenth holdout plus non-target-client training samples.",
+        "  Nonmember candidates: one-tenth holdout samples.",
+        "  Non-target clients: update references used to estimate Qout.",
         "  Metrics: AUC, F1 at delta, TPR/TNR/FPR, and TPR@low FPR including 0.1%.",
         "",
         "Data And DAG",
@@ -874,6 +1143,11 @@ def main():
     os.makedirs(args.report_dir, exist_ok=True)
     report_path = os.path.join(args.report_dir, f"{experiment_id}.txt")
     csv_path = os.path.join(args.report_dir, f"{experiment_id}.csv")
+    patient_observation_csv_path = os.path.join(
+        args.report_dir, f"{experiment_id}_patient_observations.csv"
+    )
+    patient_metrics_csv_path = os.path.join(args.report_dir, f"{experiment_id}_patient_metrics.csv")
+    patient_report_path = os.path.join(args.report_dir, f"{experiment_id}_patient_metrics.txt")
     start_time = time.time()
 
     LOGGER.info("experiment_id=%s", experiment_id)
@@ -923,6 +1197,7 @@ def main():
         raise ValueError("Grid is empty; check client/sample settings.")
 
     config_rows = []
+    all_results: List[TrajectoryResult] = []
     global_run_id = 1
     for config in configs:
         LOGGER.info(
@@ -951,6 +1226,7 @@ def main():
                 jsonl_path,
             )
             config_results.append(result)
+            all_results.append(result)
             global_run_id += 1
         summary = summarize_config(config_results, args)
         row = {
@@ -975,18 +1251,33 @@ def main():
         )
 
     total_elapsed = time.time() - start_time
+    patient_observation_rows = make_patient_observation_rows(all_results, args, y)
+    patient_metric_rows = make_patient_metric_rows(patient_observation_rows)
+    write_csv(patient_observation_csv_path, patient_observation_rows)
+    write_csv(patient_metrics_csv_path, patient_metric_rows)
+    write_patient_report(
+        patient_report_path,
+        experiment_id,
+        patient_observation_csv_path,
+        patient_metrics_csv_path,
+        patient_metric_rows,
+    )
     write_report(
         report_path,
         experiment_id,
         log_path,
         jsonl_path,
         csv_path,
+        patient_observation_csv_path,
+        patient_metrics_csv_path,
+        patient_report_path,
         args,
         data_summary,
         config_rows,
         total_elapsed,
     )
     LOGGER.info("report_path=%s", report_path)
+    LOGGER.info("patient_metrics_report_path=%s", patient_report_path)
 
 
 if __name__ == "__main__":

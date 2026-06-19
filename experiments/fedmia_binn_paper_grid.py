@@ -64,6 +64,7 @@ class TrajectoryResult:
     nonmember_scores: Dict[str, List[float]]
     member_indices: List[int]
     nonmember_indices: List[int]
+    nonmember_source: str
 
 
 def parse_args():
@@ -99,7 +100,33 @@ def parse_args():
         "--candidate-count",
         type=int,
         default=0,
-        help="candidate members/nonmembers per run; 0 uses the largest balanced target-client/holdout set",
+        help="candidate members/nonmembers per run; 0 uses the largest balanced target/nonmember set",
+    )
+    parser.add_argument(
+        "--nonmember-source",
+        default="holdout",
+        choices=["holdout", "other_clients", "target_nonmembers", "combined"],
+        help=(
+            "OUT candidate source relative to target client 0: holdout uses only globally unseen patients; "
+            "other_clients uses only patients trained by non-target clients; "
+            "target_nonmembers uses both non-target-client patients and holdout patients. "
+            "combined is a legacy alias for target_nonmembers."
+        ),
+    )
+    parser.add_argument(
+        "--min-patient-state-appearances",
+        type=int,
+        default=2,
+        help="minimum IN and OUT appearances required for patientwise vulnerability ranking",
+    )
+    parser.add_argument(
+        "--audit-patient-count",
+        type=int,
+        default=0,
+        help=(
+            "fixed audited-patient count; 0 keeps random candidate sampling. "
+            "When >0, audited patients are alternated between target-client IN and configured OUT states."
+        ),
     )
     parser.add_argument("--batch-size", type=int, default=16, help="local training batch size")
     parser.add_argument("--lr", type=float, default=0.03, help="local optimizer learning rate")
@@ -303,21 +330,97 @@ def make_client_indices(labels, train_indices, config: GridConfig, rng) -> List[
     )
 
 
-def make_candidate_indices(labels, client_indices, holdout_indices, candidate_count: int, rng):
+def nonmember_pool_for_source(client_indices, holdout_indices, nonmember_source: str) -> List[int]:
+    if nonmember_source == "holdout":
+        return list(holdout_indices)
+    other_client_indices = [
+        idx for client_indices_for_one_client in client_indices[1:]
+        for idx in client_indices_for_one_client
+    ]
+    if nonmember_source == "other_clients":
+        return other_client_indices
+    if nonmember_source in {"target_nonmembers", "combined"}:
+        return other_client_indices + list(holdout_indices)
+    raise ValueError(f"Unsupported nonmember source: {nonmember_source}")
+
+
+def make_candidate_indices(
+    labels,
+    client_indices,
+    holdout_indices,
+    candidate_count: int,
+    rng,
+    nonmember_source: str = "holdout",
+):
     target_pool = list(client_indices[0])
-    nonmember_pool = list(holdout_indices)
+    nonmember_pool = nonmember_pool_for_source(client_indices, holdout_indices, nonmember_source)
+    if not nonmember_pool:
+        raise ValueError(f"Nonmember source '{nonmember_source}' produced an empty candidate pool.")
     max_balanced_count = min(len(target_pool), len(nonmember_pool))
     member_count = max_balanced_count if candidate_count <= 0 else min(candidate_count, max_balanced_count)
     if member_count < len(target_pool) and candidate_count <= 0:
         LOGGER.info(
-            "Capping attack candidates to %s because target client has %s samples and holdout has %s.",
+            "Capping attack candidates to %s because target client has %s samples and %s has %s.",
             member_count,
             len(target_pool),
+            nonmember_source,
             len(nonmember_pool),
         )
     member_indices = balanced_draw(labels, member_count, rng, target_pool)
     nonmember_indices = balanced_draw(labels, member_count, rng, nonmember_pool)
     return member_indices, nonmember_indices
+
+
+def choose_audit_patient_indices(labels, train_indices, audit_patient_count: int, rng) -> List[int]:
+    if audit_patient_count <= 0:
+        return []
+    count = min(int(audit_patient_count), len(train_indices))
+    return balanced_draw(labels, count, rng, train_indices)
+
+
+def apply_audit_patient_assignments(
+    client_indices: Sequence[Sequence[int]],
+    audit_indices: Sequence[int],
+    run_id: int,
+    rng,
+    nonmember_source: str = "target_nonmembers",
+) -> Tuple[List[List[int]], List[int], List[int]]:
+    if not audit_indices:
+        return [list(indices) for indices in client_indices], [], []
+    if nonmember_source not in {"holdout", "other_clients", "target_nonmembers", "combined"}:
+        raise ValueError(f"Unsupported audited-patient nonmember source: {nonmember_source}")
+    if nonmember_source == "other_clients" and len(client_indices) < 2:
+        raise ValueError("Audited-patient OUT assignment requires at least two clients.")
+
+    audit_set = {int(idx) for idx in audit_indices}
+    cleaned_clients = [
+        [int(idx) for idx in indices if int(idx) not in audit_set]
+        for indices in client_indices
+    ]
+    member_indices: List[int] = []
+    nonmember_indices: List[int] = []
+
+    for position, patient_index in enumerate(int(idx) for idx in audit_indices):
+        is_member = ((position + run_id) % 2) == 0
+        if is_member:
+            cleaned_clients[0].append(patient_index)
+            member_indices.append(patient_index)
+        else:
+            use_other_client = nonmember_source == "other_clients" or (
+                nonmember_source in {"target_nonmembers", "combined"}
+                and len(cleaned_clients) > 1
+                and float(rng.random()) < 0.5
+            )
+            if use_other_client:
+                non_target_client = 1 + int(rng.integers(0, len(cleaned_clients) - 1))
+                cleaned_clients[non_target_client].append(patient_index)
+            nonmember_indices.append(patient_index)
+
+    for indices in cleaned_clients:
+        rng.shuffle(indices)
+    rng.shuffle(member_indices)
+    rng.shuffle(nonmember_indices)
+    return cleaned_clients, member_indices, nonmember_indices
 
 
 def make_loaders(x, y, client_indices, holdout_indices, args, seed):
@@ -377,6 +480,7 @@ def run_one_trajectory(
     y,
     train_indices,
     holdout_indices,
+    audit_indices,
     args,
     device,
     jsonl_path: str,
@@ -385,9 +489,23 @@ def run_one_trajectory(
     set_seed(run_seed)
     rng = np.random.default_rng(run_seed)
     client_indices = make_client_indices(y, train_indices, config, rng)
-    member_indices, nonmember_indices = make_candidate_indices(
-        y, client_indices, holdout_indices, args.candidate_count, rng
-    )
+    if audit_indices:
+        client_indices, member_indices, nonmember_indices = apply_audit_patient_assignments(
+            client_indices,
+            audit_indices,
+            run_id,
+            rng,
+            args.nonmember_source,
+        )
+    else:
+        member_indices, nonmember_indices = make_candidate_indices(
+            y,
+            client_indices,
+            holdout_indices,
+            args.candidate_count,
+            rng,
+            args.nonmember_source,
+        )
     client_datasets, client_loaders, train_loader, holdout_loader = make_loaders(
         x, y, client_indices, holdout_indices, args, run_seed
     )
@@ -407,7 +525,7 @@ def run_one_trajectory(
     LOGGER.info(
         "config=%03d run=%03d started seed=%s clients=%s rounds=%s local_epochs=%s "
         "beta=%s samples_per_client=%s member_candidates=%s nonmember_candidates=%s "
-        "initial_train_acc=%.4f initial_holdout_acc=%.4f client_sizes=%s",
+        "nonmember_source=%s initial_train_acc=%.4f initial_holdout_acc=%.4f client_sizes=%s",
         config.config_id,
         run_id,
         run_seed,
@@ -418,6 +536,7 @@ def run_one_trajectory(
         config.samples_per_client,
         len(member_indices),
         len(nonmember_indices),
+        args.nonmember_source,
         train_acc_initial,
         holdout_acc_initial,
         [len(indices) for indices in client_indices],
@@ -429,6 +548,8 @@ def run_one_trajectory(
             "config_id": config.config_id,
             "run": run_id,
             "seed": run_seed,
+            "nonmember_source": args.nonmember_source,
+            "audit_patient_count": len(audit_indices),
             "client_sizes": [len(indices) for indices in client_indices],
             "member_candidates": len(member_indices),
             "nonmember_candidates": len(nonmember_indices),
@@ -604,6 +725,8 @@ def run_one_trajectory(
             "holdout_acc_final": holdout_acc_final,
             "member_count": len(member_indices),
             "nonmember_count": len(nonmember_indices),
+            "nonmember_source": args.nonmember_source,
+            "audit_patient_count": len(audit_indices),
             "client_sizes": [len(indices) for indices in client_indices],
             "elapsed_seconds": elapsed,
             "fedmia_i_loss_threshold_sweep": loss_sweep_rows,
@@ -634,6 +757,7 @@ def run_one_trajectory(
         },
         member_indices=[int(idx) for idx in member_indices],
         nonmember_indices=[int(idx) for idx in nonmember_indices],
+        nonmember_source=args.nonmember_source,
     )
 
 
@@ -713,6 +837,7 @@ def make_patient_observation_rows(results: Sequence[TrajectoryResult], args, y) 
                         "run": result.run_id,
                         "seed": result.seed,
                         "measurement": measurement,
+                        "nonmember_source": result.nonmember_source,
                         "patient_index": int(patient_index),
                         "class_label": int(y[patient_index].item()),
                         "membership_label": 1,
@@ -732,6 +857,7 @@ def make_patient_observation_rows(results: Sequence[TrajectoryResult], args, y) 
                         "run": result.run_id,
                         "seed": result.seed,
                         "measurement": measurement,
+                        "nonmember_source": result.nonmember_source,
                         "patient_index": int(patient_index),
                         "class_label": int(y[patient_index].item()),
                         "membership_label": 0,
@@ -781,6 +907,13 @@ def make_patient_metric_rows(observation_rows: Sequence[Dict[str, float]]) -> Li
         nonmember_auc_parts = [float(row["auc_contribution"]) for row in nonmember_rows]
         all_scores = [float(row["score"]) for row in rows]
         all_auc_parts = [float(row["auc_contribution"]) for row in rows]
+        member_score_mean = safe_mean(member_scores)
+        nonmember_score_mean = safe_mean(nonmember_scores)
+        score_gap = (
+            member_score_mean - nonmember_score_mean
+            if not math.isnan(member_score_mean) and not math.isnan(nonmember_score_mean)
+            else float("nan")
+        )
         metric_rows.append(
             {
                 "config_id": config_id,
@@ -803,14 +936,78 @@ def make_patient_metric_rows(observation_rows: Sequence[Dict[str, float]]) -> Li
                 "has_both_membership_states": 1 if member_rows and nonmember_rows else 0,
                 "score_mean": safe_mean(all_scores),
                 "score_std": safe_sample_std(all_scores),
-                "member_score_mean": safe_mean(member_scores),
-                "nonmember_score_mean": safe_mean(nonmember_scores),
+                "member_score_mean": member_score_mean,
+                "nonmember_score_mean": nonmember_score_mean,
+                "score_gap": score_gap,
                 "auc_contribution_mean": safe_mean(all_auc_parts),
                 "member_auc_contribution_mean": safe_mean(member_auc_parts),
                 "nonmember_auc_contribution_mean": safe_mean(nonmember_auc_parts),
             }
         )
     return metric_rows
+
+
+def patient_row_is_eligible(row: Dict[str, float], min_state_appearances: int) -> bool:
+    try:
+        return (
+            int(row["member_appearances"]) >= min_state_appearances
+            and int(row["nonmember_appearances"]) >= min_state_appearances
+            and not math.isnan(float(row["auc"]))
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def summarize_patient_vulnerability(
+    patient_rows: Sequence[Dict[str, float]],
+    min_state_appearances: int,
+) -> Dict[str, float]:
+    summary: Dict[str, float] = {}
+    for measurement in ("fedmia_i_loss", "fedmia_ii_cosine"):
+        prefix = f"{measurement}_patient"
+        rows = [row for row in patient_rows if row["measurement"] == measurement]
+        both_rows = [row for row in rows if int(row["has_both_membership_states"]) == 1]
+        eligible_rows = [
+            row for row in rows if patient_row_is_eligible(row, min_state_appearances)
+        ]
+        auc_values = [float(row["auc"]) for row in eligible_rows]
+        gap_values = [float(row["score_gap"]) for row in eligible_rows]
+        auc_mean, auc_std = mean_std(auc_values)
+        gap_mean, gap_std = mean_std(gap_values)
+        summary[f"{prefix}_patients_observed"] = float(len(rows))
+        summary[f"{prefix}_patients_with_both_states"] = float(len(both_rows))
+        summary[f"{prefix}_eligible_patients"] = float(len(eligible_rows))
+        summary[f"{prefix}_auc_mean"] = auc_mean
+        summary[f"{prefix}_auc_std"] = auc_std
+        summary[f"{prefix}_score_gap_mean"] = gap_mean
+        summary[f"{prefix}_score_gap_std"] = gap_std
+
+        if eligible_rows:
+            ranked = sorted(
+                eligible_rows,
+                key=lambda row: (
+                    float(row["auc"]),
+                    float(row["score_gap"]) if not math.isnan(float(row["score_gap"])) else -999.0,
+                ),
+            )
+            least = ranked[0]
+            most = ranked[-1]
+            for label, row in (("least", least), ("most", most)):
+                summary[f"{prefix}_{label}_vulnerable_patient"] = float(row["patient_index"])
+                summary[f"{prefix}_{label}_vulnerable_class_label"] = float(row["class_label"])
+                summary[f"{prefix}_{label}_vulnerable_auc"] = float(row["auc"])
+                summary[f"{prefix}_{label}_vulnerable_score_gap"] = float(row["score_gap"])
+                summary[f"{prefix}_{label}_vulnerable_member_n"] = float(row["member_appearances"])
+                summary[f"{prefix}_{label}_vulnerable_nonmember_n"] = float(row["nonmember_appearances"])
+        else:
+            for label in ("least", "most"):
+                summary[f"{prefix}_{label}_vulnerable_patient"] = float("nan")
+                summary[f"{prefix}_{label}_vulnerable_class_label"] = float("nan")
+                summary[f"{prefix}_{label}_vulnerable_auc"] = float("nan")
+                summary[f"{prefix}_{label}_vulnerable_score_gap"] = float("nan")
+                summary[f"{prefix}_{label}_vulnerable_member_n"] = 0.0
+                summary[f"{prefix}_{label}_vulnerable_nonmember_n"] = 0.0
+    return summary
 
 
 def format_patient_value(value) -> str:
@@ -827,6 +1024,7 @@ def write_patient_report(
     observation_csv_path: str,
     patient_csv_path: str,
     patient_rows: Sequence[Dict[str, float]],
+    min_state_appearances: int,
 ):
     lines = [
         "FedMIA BINN Patient-Level Metrics Report",
@@ -840,6 +1038,8 @@ def write_patient_report(
         "  pairwise contribution to the global AUC in the runs where it appeared.",
         "  member_correct_rate is the rate of correct IN predictions when the patient was a member.",
         "  nonmember_correct_rate is the rate of correct OUT predictions when the patient was a nonmember.",
+        f"  vulnerability rankings require member_n >= {min_state_appearances} and "
+        f"nonmember_n >= {min_state_appearances}.",
         "",
     ]
     for measurement in ("fedmia_i_loss", "fedmia_ii_cosine"):
@@ -850,6 +1050,10 @@ def write_patient_report(
                 f"{measurement}",
                 f"  patients_observed: {len(rows)}",
                 f"  patients_with_both_in_and_out_states: {len(both_rows)}",
+                (
+                    "  patients_eligible_for_vulnerability_ranking: "
+                    f"{sum(1 for row in rows if patient_row_is_eligible(row, min_state_appearances))}"
+                ),
                 "  Top member leakage cases",
             ]
         )
@@ -866,7 +1070,7 @@ def write_patient_report(
         for row in member_rows[:10]:
             lines.append(
                 "    "
-                f"patient={row['patient_index']} class_label={row['class_label']} "
+                f"config={row['config_id']} patient={row['patient_index']} class_label={row['class_label']} "
                 f"member_n={row['member_appearances']} "
                 f"member_correct_rate={format_patient_value(row['member_correct_rate'])} "
                 f"member_auc_contribution={format_patient_value(row['member_auc_contribution_mean'])} "
@@ -888,7 +1092,7 @@ def write_patient_report(
         for row in nonmember_rows[:10]:
             lines.append(
                 "    "
-                f"patient={row['patient_index']} class_label={row['class_label']} "
+                f"config={row['config_id']} patient={row['patient_index']} class_label={row['class_label']} "
                 f"nonmember_n={row['nonmember_appearances']} "
                 f"false_positive_rate={format_patient_value(row['nonmember_false_positive_rate'])} "
                 f"nonmember_correct_rate={format_patient_value(row['nonmember_correct_rate'])} "
@@ -896,12 +1100,32 @@ def write_patient_report(
                 f"nonmember_score_mean={format_patient_value(row['nonmember_score_mean'])}"
             )
         lines.append("  Patients with per-patient AUC available")
-        both_rows.sort(key=lambda row: -float(row["auc"]))
-        for row in both_rows[:10]:
+        eligible_rows = [
+            row for row in both_rows if patient_row_is_eligible(row, min_state_appearances)
+        ]
+        eligible_rows.sort(
+            key=lambda row: (
+                -float(row["auc"]),
+                -float(row["score_gap"]) if not math.isnan(float(row["score_gap"])) else 1.0,
+            )
+        )
+        for row in eligible_rows[:10]:
             lines.append(
                 "    "
-                f"patient={row['patient_index']} class_label={row['class_label']} "
+                f"config={row['config_id']} patient={row['patient_index']} class_label={row['class_label']} "
                 f"auc={format_patient_value(row['auc'])} "
+                f"score_gap={format_patient_value(row['score_gap'])} "
+                f"f1={format_patient_value(row['f1'])} "
+                f"member_n={row['member_appearances']} "
+                f"nonmember_n={row['nonmember_appearances']}"
+            )
+        lines.append("  Least vulnerable patients with per-patient AUC available")
+        for row in list(reversed(eligible_rows[-10:])):
+            lines.append(
+                "    "
+                f"config={row['config_id']} patient={row['patient_index']} class_label={row['class_label']} "
+                f"auc={format_patient_value(row['auc'])} "
+                f"score_gap={format_patient_value(row['score_gap'])} "
                 f"f1={format_patient_value(row['f1'])} "
                 f"member_n={row['member_appearances']} "
                 f"nonmember_n={row['nonmember_appearances']}"
@@ -1039,7 +1263,10 @@ def write_report(
         "  Qout estimate: non-target client updates in the same communication round.",
         "  FedMIA-I: negative model loss measurement.",
         "  FedMIA-II: gradient-cosine measurement from Eq. (7).",
-        "  Nonmember candidates: one-tenth holdout samples.",
+        f"  Nonmember candidate source: {args.nonmember_source}.",
+        "  holdout means globally unseen patients.",
+        "  other_clients means patients trained by non-target clients.",
+        "  target_nonmembers means all patients absent from target client 0: non-target-client plus holdout patients.",
         "  Non-target clients: update references used to estimate Qout.",
         "  Metrics: AUC, F1 at delta, TPR/TNR/FPR, and TPR@low FPR including 0.1%.",
         "",
@@ -1050,6 +1277,7 @@ def write_report(
         f"  graph_edges: {data_summary['graph_edges']}",
         f"  train_pool_count_after_holdout: {data_summary['train_count']}",
         f"  holdout_count: {data_summary['holdout_count']}",
+        f"  audit_patient_count: {data_summary['audit_patient_count']}",
         f"  positive_rate: {data_summary['positive_rate']:.6f}",
         "",
         "Configuration",
@@ -1062,6 +1290,9 @@ def write_report(
         f"  samples_per_client_grid: {args.samples_per_client_grid}",
         f"  holdout_fraction: {args.holdout_fraction}",
         f"  candidate_count: {args.candidate_count}",
+        f"  nonmember_source: {args.nonmember_source}",
+        f"  audit_patient_count: {args.audit_patient_count}",
+        f"  min_patient_state_appearances: {args.min_patient_state_appearances}",
         f"  threshold_delta: {args.threshold}",
         f"  device_requested: {args.device}",
         f"  gpu: {args.gpu}",
@@ -1119,6 +1350,24 @@ def write_report(
                     f"fpr={row['fedmia_ii_cosine_pooled_fpr']:.6f} "
                     f"tpr@fpr0.001={row['fedmia_ii_cosine_pooled_tpr_at_fpr_0.001']:.6f}"
                 ),
+                (
+                    "    Patient vulnerability FedMIA-I "
+                    f"eligible={int(row.get('fedmia_i_loss_patient_eligible_patients', 0))} "
+                    f"auc_mean={row.get('fedmia_i_loss_patient_auc_mean', float('nan')):.6f} "
+                    f"most_patient={row.get('fedmia_i_loss_patient_most_vulnerable_patient', float('nan')):.0f} "
+                    f"most_auc={row.get('fedmia_i_loss_patient_most_vulnerable_auc', float('nan')):.6f} "
+                    f"least_patient={row.get('fedmia_i_loss_patient_least_vulnerable_patient', float('nan')):.0f} "
+                    f"least_auc={row.get('fedmia_i_loss_patient_least_vulnerable_auc', float('nan')):.6f}"
+                ),
+                (
+                    "    Patient vulnerability FedMIA-II "
+                    f"eligible={int(row.get('fedmia_ii_cosine_patient_eligible_patients', 0))} "
+                    f"auc_mean={row.get('fedmia_ii_cosine_patient_auc_mean', float('nan')):.6f} "
+                    f"most_patient={row.get('fedmia_ii_cosine_patient_most_vulnerable_patient', float('nan')):.0f} "
+                    f"most_auc={row.get('fedmia_ii_cosine_patient_most_vulnerable_auc', float('nan')):.6f} "
+                    f"least_patient={row.get('fedmia_ii_cosine_patient_least_vulnerable_patient', float('nan')):.0f} "
+                    f"least_auc={row.get('fedmia_ii_cosine_patient_least_vulnerable_auc', float('nan')):.6f}"
+                ),
             ]
         )
     lines.extend(
@@ -1139,6 +1388,10 @@ def write_report(
 def main():
     args = parse_args()
     experiment_id = make_experiment_id()
+    report_root = args.report_dir
+    log_root = args.log_dir
+    args.report_dir = os.path.join(report_root, experiment_id)
+    args.log_dir = os.path.join(log_root, experiment_id)
     log_path, jsonl_path = configure_logging(args, experiment_id)
     os.makedirs(args.report_dir, exist_ok=True)
     report_path = os.path.join(args.report_dir, f"{experiment_id}.txt")
@@ -1163,6 +1416,13 @@ def main():
     x, y = research.load_pnet_data(selected_features, args)
     split_rng = np.random.default_rng(args.seed)
     train_indices, holdout_indices = stratified_holdout_split(y, args.holdout_fraction, split_rng)
+    audit_rng = np.random.default_rng(args.seed + 17_171)
+    audit_indices = choose_audit_patient_indices(
+        y,
+        train_indices,
+        args.audit_patient_count,
+        audit_rng,
+    )
     configs = make_grid(args, len(train_indices))
     data_summary = {
         "samples_loaded": int(x.shape[0]),
@@ -1171,6 +1431,7 @@ def main():
         "graph_edges": int(graph.number_of_edges()),
         "train_count": len(train_indices),
         "holdout_count": len(holdout_indices),
+        "audit_patient_count": len(audit_indices),
         "positive_rate": float(y.mean().item()),
     }
     LOGGER.info(
@@ -1190,6 +1451,7 @@ def main():
             "experiment_id": experiment_id,
             "args": vars(args),
             "data_summary": data_summary,
+            "audit_patient_indices_head": [int(idx) for idx in audit_indices[:20]],
             "configs": [config.__dict__ for config in configs],
         },
     )
@@ -1221,6 +1483,7 @@ def main():
                 y,
                 train_indices,
                 holdout_indices,
+                audit_indices,
                 args,
                 device,
                 jsonl_path,
@@ -1235,10 +1498,20 @@ def main():
             "rounds": config.rounds,
             "local_epochs": config.local_epochs,
             "beta_label": config.beta_label,
+            "nonmember_source": args.nonmember_source,
+            "audit_patient_count": len(audit_indices),
             "sample_fraction": config.sample_fraction if config.sample_fraction is not None else "",
             "samples_per_client": config.samples_per_client,
             **summary,
         }
+        config_patient_observation_rows = make_patient_observation_rows(config_results, args, y)
+        config_patient_metric_rows = make_patient_metric_rows(config_patient_observation_rows)
+        row.update(
+            summarize_patient_vulnerability(
+                config_patient_metric_rows,
+                args.min_patient_state_appearances,
+            )
+        )
         config_rows.append(row)
         write_csv(csv_path, config_rows)
         append_jsonl(jsonl_path, {"event": "config_result", **row})
@@ -1261,6 +1534,7 @@ def main():
         patient_observation_csv_path,
         patient_metrics_csv_path,
         patient_metric_rows,
+        args.min_patient_state_appearances,
     )
     write_report(
         report_path,

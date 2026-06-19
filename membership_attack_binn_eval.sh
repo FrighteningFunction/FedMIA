@@ -78,6 +78,8 @@ run_config() {
   echo "  SAMPLE_FRACTION_GRID=${SAMPLE_FRACTION_GRID}"
   echo "  SAMPLES_PER_CLIENT_GRID=${SAMPLES_PER_CLIENT_GRID}"
   echo "  CANDIDATE_COUNT=${CANDIDATE_COUNT}"
+  echo "  AUDIT_PATIENT_COUNT=${AUDIT_PATIENT_COUNT:-0}"
+  echo "  NONMEMBER_SOURCE=${NONMEMBER_SOURCE:-holdout}"
 
   RUNS="${RUNS_PER_CONFIG}" \
   CLIENT_GRID="${clients}" \
@@ -87,6 +89,9 @@ run_config() {
   SAMPLE_FRACTION_GRID="${SAMPLE_FRACTION_GRID}" \
   SAMPLES_PER_CLIENT_GRID="${SAMPLES_PER_CLIENT_GRID}" \
   CANDIDATE_COUNT="${CANDIDATE_COUNT}" \
+  AUDIT_PATIENT_COUNT="${AUDIT_PATIENT_COUNT:-0}" \
+  NONMEMBER_SOURCE="${NONMEMBER_SOURCE:-holdout}" \
+  MIN_PATIENT_STATE_APPEARANCES="${MIN_PATIENT_STATE_APPEARANCES:-2}" \
   BATCH_SIZE="${BATCH_SIZE}" \
   LR="${LR}" \
   WEIGHT_DECAY="${WEIGHT_DECAY}" \
@@ -102,7 +107,7 @@ run_config() {
   bash membership_attack.sh
 
   local latest_csv
-  latest_csv="$(ls -t "${REPORT_DIR}"/fedmia_binn_paper_grid_*.csv | head -1)"
+  latest_csv="$(find "${REPORT_DIR}" -name 'fedmia_binn_paper_grid_*.csv' -type f -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
   echo "${latest_csv}" >> "${CSV_LIST_FILE}"
 }
 

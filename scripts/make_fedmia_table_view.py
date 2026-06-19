@@ -20,6 +20,8 @@ PAPER_COLUMNS = [
     "config_label",
     "aggregation",
     "method",
+    "nonmember_source",
+    "audit_patient_count",
     "member_count",
     "nonmember_count",
     "train_acc",
@@ -36,6 +38,12 @@ PAPER_COLUMNS = [
     "tpr_at_fpr_0.1",
     "best_f1",
     "best_threshold",
+    "fedmia_i_loss_patient_auc",
+    "fedmia_i_loss_most_vulnerable_patient",
+    "fedmia_i_loss_most_vulnerable_auc",
+    "fedmia_ii_cosine_patient_auc",
+    "fedmia_ii_cosine_most_vulnerable_patient",
+    "fedmia_ii_cosine_most_vulnerable_auc",
     "source_file",
 ]
 
@@ -44,6 +52,8 @@ CONFIG_COLUMNS = [
     "config_label",
     "aggregation",
     "method",
+    "nonmember_source",
+    "audit_patient_count",
 ]
 
 SPLIT_RESULT_COLUMNS = [
@@ -66,6 +76,12 @@ SPLIT_RESULT_COLUMNS = [
         "tpr_at_fpr_0.1",
         "best_f1",
         "best_threshold",
+        "fedmia_i_loss_patient_auc",
+        "fedmia_i_loss_most_vulnerable_patient",
+        "fedmia_i_loss_most_vulnerable_auc",
+        "fedmia_ii_cosine_patient_auc",
+        "fedmia_ii_cosine_most_vulnerable_patient",
+        "fedmia_ii_cosine_most_vulnerable_auc",
     ],
 ]
 
@@ -74,6 +90,8 @@ SHORT_LABELS = {
     "config_label": "Configuration",
     "aggregation": "Aggregation",
     "method": "Method",
+    "nonmember_source": "OUT Source",
+    "audit_patient_count": "Audit Patients",
     "member_count": "Members",
     "nonmember_count": "Nonmembers",
     "train_acc": "Train Acc.",
@@ -90,6 +108,24 @@ SHORT_LABELS = {
     "tpr_at_fpr_0.1": "TPR@FPR 0.1",
     "best_f1": "Best F1",
     "best_threshold": "Best Threshold",
+    "fedmia_i_loss_patient_eligible": "Loss Patient n",
+    "fedmia_i_loss_patient_auc": "Loss Patient AUC",
+    "fedmia_i_loss_patient_score_gap": "Loss Patient Gap",
+    "fedmia_i_loss_most_vulnerable_patient": "Loss Most Vuln. Patient",
+    "fedmia_i_loss_most_vulnerable_auc": "Loss Most Vuln. AUC",
+    "fedmia_i_loss_most_vulnerable_score_gap": "Loss Most Vuln. Gap",
+    "fedmia_i_loss_least_vulnerable_patient": "Loss Least Vuln. Patient",
+    "fedmia_i_loss_least_vulnerable_auc": "Loss Least Vuln. AUC",
+    "fedmia_i_loss_least_vulnerable_score_gap": "Loss Least Vuln. Gap",
+    "fedmia_ii_cosine_patient_eligible": "Cosine Patient n",
+    "fedmia_ii_cosine_patient_auc": "Cosine Patient AUC",
+    "fedmia_ii_cosine_patient_score_gap": "Cosine Patient Gap",
+    "fedmia_ii_cosine_most_vulnerable_patient": "Cosine Most Vuln. Patient",
+    "fedmia_ii_cosine_most_vulnerable_auc": "Cosine Most Vuln. AUC",
+    "fedmia_ii_cosine_most_vulnerable_score_gap": "Cosine Most Vuln. Gap",
+    "fedmia_ii_cosine_least_vulnerable_patient": "Cosine Least Vuln. Patient",
+    "fedmia_ii_cosine_least_vulnerable_auc": "Cosine Least Vuln. AUC",
+    "fedmia_ii_cosine_least_vulnerable_score_gap": "Cosine Least Vuln. Gap",
     "source_file": "Source",
 }
 

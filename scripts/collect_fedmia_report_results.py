@@ -38,9 +38,11 @@ OUTPUT_COLUMNS = [
     "local_epochs",
     "beta_label",
     "samples_per_client",
+    "nonmember_source",
     "runs",
     "runs_per_config",
     "candidate_count",
+    "audit_patient_count",
     "holdout_fraction",
     "threshold_delta",
     "member_count",
@@ -63,6 +65,24 @@ OUTPUT_COLUMNS = [
     "tpr_at_fpr_0.1",
     "best_f1",
     "best_threshold",
+    "fedmia_i_loss_patient_eligible",
+    "fedmia_i_loss_patient_auc",
+    "fedmia_i_loss_patient_score_gap",
+    "fedmia_i_loss_most_vulnerable_patient",
+    "fedmia_i_loss_most_vulnerable_auc",
+    "fedmia_i_loss_most_vulnerable_score_gap",
+    "fedmia_i_loss_least_vulnerable_patient",
+    "fedmia_i_loss_least_vulnerable_auc",
+    "fedmia_i_loss_least_vulnerable_score_gap",
+    "fedmia_ii_cosine_patient_eligible",
+    "fedmia_ii_cosine_patient_auc",
+    "fedmia_ii_cosine_patient_score_gap",
+    "fedmia_ii_cosine_most_vulnerable_patient",
+    "fedmia_ii_cosine_most_vulnerable_auc",
+    "fedmia_ii_cosine_most_vulnerable_score_gap",
+    "fedmia_ii_cosine_least_vulnerable_patient",
+    "fedmia_ii_cosine_least_vulnerable_auc",
+    "fedmia_ii_cosine_least_vulnerable_score_gap",
 ]
 
 RESULT_METRICS = [
@@ -87,6 +107,27 @@ UTILITY_SOURCES = {
     "train_acc": "train_acc_final",
     "holdout_acc": "holdout_acc_final",
     "test_acc": "test_acc_final",
+}
+
+PATIENT_SUMMARY_SOURCES = {
+    "fedmia_i_loss_patient_eligible": "fedmia_i_loss_patient_eligible_patients",
+    "fedmia_i_loss_patient_auc": "fedmia_i_loss_patient_auc_mean",
+    "fedmia_i_loss_patient_score_gap": "fedmia_i_loss_patient_score_gap_mean",
+    "fedmia_i_loss_most_vulnerable_patient": "fedmia_i_loss_patient_most_vulnerable_patient",
+    "fedmia_i_loss_most_vulnerable_auc": "fedmia_i_loss_patient_most_vulnerable_auc",
+    "fedmia_i_loss_most_vulnerable_score_gap": "fedmia_i_loss_patient_most_vulnerable_score_gap",
+    "fedmia_i_loss_least_vulnerable_patient": "fedmia_i_loss_patient_least_vulnerable_patient",
+    "fedmia_i_loss_least_vulnerable_auc": "fedmia_i_loss_patient_least_vulnerable_auc",
+    "fedmia_i_loss_least_vulnerable_score_gap": "fedmia_i_loss_patient_least_vulnerable_score_gap",
+    "fedmia_ii_cosine_patient_eligible": "fedmia_ii_cosine_patient_eligible_patients",
+    "fedmia_ii_cosine_patient_auc": "fedmia_ii_cosine_patient_auc_mean",
+    "fedmia_ii_cosine_patient_score_gap": "fedmia_ii_cosine_patient_score_gap_mean",
+    "fedmia_ii_cosine_most_vulnerable_patient": "fedmia_ii_cosine_patient_most_vulnerable_patient",
+    "fedmia_ii_cosine_most_vulnerable_auc": "fedmia_ii_cosine_patient_most_vulnerable_auc",
+    "fedmia_ii_cosine_most_vulnerable_score_gap": "fedmia_ii_cosine_patient_most_vulnerable_score_gap",
+    "fedmia_ii_cosine_least_vulnerable_patient": "fedmia_ii_cosine_patient_least_vulnerable_patient",
+    "fedmia_ii_cosine_least_vulnerable_auc": "fedmia_ii_cosine_patient_least_vulnerable_auc",
+    "fedmia_ii_cosine_least_vulnerable_score_gap": "fedmia_ii_cosine_patient_least_vulnerable_score_gap",
 }
 
 
@@ -220,6 +261,18 @@ def enrich_from_companion(row: Dict[str, object], companion: Dict[str, Dict[str,
 
     set_from_source(row, source, "member_count_mean", "member_count")
     set_from_source(row, source, "nonmember_count_mean", "nonmember_count")
+    set_from_source(row, source, "nonmember_source", "nonmember_source")
+    set_from_source(row, source, "audit_patient_count", "audit_patient_count")
+
+    for target_key, source_key in PATIENT_SUMMARY_SOURCES.items():
+        set_from_source(row, source, source_key, target_key)
+    for target_key, source_key in (
+        ("fedmia_i_loss_patient_auc", "fedmia_i_loss_patient_auc_std"),
+        ("fedmia_i_loss_patient_score_gap", "fedmia_i_loss_patient_score_gap_std"),
+        ("fedmia_ii_cosine_patient_auc", "fedmia_ii_cosine_patient_auc_std"),
+        ("fedmia_ii_cosine_patient_score_gap", "fedmia_ii_cosine_patient_score_gap_std"),
+    ):
+        set_from_source(row, source, source_key, f"{target_key}_std")
 
     measurement = row.get("measurement")
     aggregation = row.get("aggregation")
@@ -329,7 +382,7 @@ def keep_row(row: Dict[str, object]) -> bool:
 def collect(report_dir: Path) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     binn_rows: List[Dict[str, object]] = []
     cifar_rows: List[Dict[str, object]] = []
-    for path in sorted(report_dir.glob("*.txt")):
+    for path in sorted(report_dir.rglob("*.txt") if report_dir.exists() else []):
         family = report_family(path)
         if family is None:
             continue
@@ -347,6 +400,7 @@ def deduplicate_latest(rows: Sequence[Dict[str, object]]) -> List[Dict[str, obje
         key = (
             row.get("dataset_model"),
             row.get("config_label"),
+            row.get("nonmember_source"),
             row.get("aggregation"),
             row.get("measurement"),
         )
@@ -362,6 +416,7 @@ def deduplicate_latest(rows: Sequence[Dict[str, object]]) -> List[Dict[str, obje
             int(to_float(row.get("local_epochs"))),
             str(row.get("beta_label", "")),
             int(to_float(row.get("samples_per_client"))),
+            str(row.get("nonmember_source", "")),
             str(row.get("measurement", "")),
             str(row.get("aggregation", "")),
         ),
@@ -426,11 +481,22 @@ def write_readme(path: Path, binn_rows: Sequence[Dict[str, object]], cifar_rows:
         "- plumbing/debug runs",
         "- BINN rows with fewer than 30 member or nonmember candidates",
         "- older duplicate rows when the same configuration/method/aggregation was rerun",
+        "- nonmember-source modes are deduplicated separately",
         "- separate `*_std` columns; nonzero standard deviations are folded into `value +/- std` cells",
         "",
         "Output files:",
         "- `binn_fedmia_results.csv`",
         "- `cifar100_alexnet_fedmia_results.csv`",
+        "- `fedmia_paper_table_view.html` (generated by `scripts/make_fedmia_table_view.py`)",
+        "- `fedmia_paper_table_view.csv`",
+        "- `fedmia_paper_table_view.tsv`",
+        "",
+        "New BINN experiment folders are scanned recursively under `reports/`.",
+        "Patient-vulnerability columns are populated when the source experiment CSV",
+        "contains per-patient summaries.",
+        "",
+        "Open `fedmia_paper_table_view.html` in a browser to filter rows, choose columns,",
+        "copy TSV tables for Word/LaTeX helpers, or download selected rows as a smaller CSV.",
         "",
         f"BINN rows written after deduplication: {len(binn_rows)}",
         f"CIFAR100/AlexNet rows written after deduplication: {len(cifar_rows)}",

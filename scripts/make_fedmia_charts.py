@@ -46,7 +46,9 @@ def as_int(row: Dict[str, str], key: str) -> int:
 
 def read_csv_rows(pattern: str, family: str) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
-    for path in sorted(glob.glob(str(REPORT_DIR / pattern))):
+    paths = []
+    paths.extend(glob.glob(str(REPORT_DIR / "**" / pattern), recursive=True))
+    for path in sorted(set(paths)):
         name = os.path.basename(path)
         if "patient_" in name:
             continue
@@ -68,6 +70,7 @@ def dedupe_latest(rows: Iterable[Dict[str, str]]) -> List[Dict[str, str]]:
             row.get("local_epochs"),
             row.get("beta_label"),
             row.get("samples_per_client"),
+            row.get("nonmember_source", ""),
         )
         if key not in by_config or row["source_csv"] > by_config[key]["source_csv"]:
             by_config[key] = row
@@ -92,6 +95,7 @@ def sort_rows(rows: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
             as_int(row, "local_epochs"),
             beta_sort_value(row.get("beta_label", "")),
             as_int(row, "samples_per_client"),
+            row.get("nonmember_source", ""),
             row.get("source_csv", ""),
         ),
     )
@@ -123,6 +127,7 @@ def label_for(row: Dict[str, str]) -> str:
     return (
         f"{as_int(row, 'clients')}c/{as_int(row, 'rounds')}r\n"
         f"{as_int(row, 'local_epochs')}e beta={row.get('beta_label', '')}"
+        f" {row.get('nonmember_source', '')}".rstrip()
     )
 
 
@@ -226,6 +231,7 @@ def write_chart_data_csv(rows: Sequence[Dict[str, str]]):
         "local_epochs",
         "beta_label",
         "samples_per_client",
+        "nonmember_source",
         "holdout_acc_final_mean",
         "test_acc_final_mean",
         "fedmia_i_loss_auc_mean",
@@ -247,7 +253,7 @@ def write_readme(binn_rows: Sequence[Dict[str, str]], cifar_rows: Sequence[Dict[
     lines = [
         "# FedMIA Run Charts",
         "",
-        "Generated from existing report CSV files in `reports/`.",
+        "Generated from existing report CSV files under `reports/`, including experiment subfolders.",
         "",
         "Main filters:",
         "- BINN paper-style charts include rows with `rounds >= 10` and `samples_per_client >= 30`.",
@@ -256,6 +262,7 @@ def write_readme(binn_rows: Sequence[Dict[str, str]], cifar_rows: Sequence[Dict[
         "- Plumbing/debug runs are excluded from the main figures.",
         "- Severely imbalanced Dirichlet rows where the target client collapsed to a tiny candidate set are excluded.",
         "- Duplicate configurations are deduplicated by keeping the latest CSV file.",
+        "- Different OUT-candidate sources such as `holdout` and `other_clients` are kept separate.",
         "",
         "Charts:",
         "- `binn_attack_auc_by_config.png/svg`: FedMIA-I and FedMIA-II AUC by BINN configuration.",

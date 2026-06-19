@@ -21,6 +21,9 @@ reports_old
 #logs
 logs
 
+#docs
+docs
+
 # report imagery
 charts
 aggregated_report

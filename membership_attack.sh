@@ -57,6 +57,9 @@ python3 -u experiments/fedmia_binn_paper_grid.py \
   --sample-fraction-grid "${SAMPLE_FRACTION_GRID:-${SAMPLE_FRACTION_GRID_DEFAULT}}" \
   --samples-per-client-grid "${SAMPLES_PER_CLIENT_GRID:-${SAMPLES_PER_CLIENT:-${SAMPLES_PER_CLIENT_GRID_DEFAULT}}}" \
   --candidate-count "${CANDIDATE_COUNT:-${CANDIDATE_COUNT_DEFAULT}}" \
+  --nonmember-source "${NONMEMBER_SOURCE:-holdout}" \
+  --min-patient-state-appearances "${MIN_PATIENT_STATE_APPEARANCES:-2}" \
+  --audit-patient-count "${AUDIT_PATIENT_COUNT:-0}" \
   --batch-size "${BATCH_SIZE:-16}" \
   --lr "${LR:-0.03}" \
   --weight-decay "${WEIGHT_DECAY:-5e-4}" \

@@ -1,12 +1,27 @@
+# Python 3.10-compatible environment for the current FedMIA/BINN pipeline.
+#
+# For a CUDA build of PyTorch, install with the PyTorch CUDA index, e.g.:
+#   python3 -m pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple
+#
+# For CPU-only installs, the normal command is usually enough:
+#   python3 -m pip install -r requirements.txt
+
+torch==2.2.2
+torchvision==0.17.2
+torchaudio==2.2.2
+
 numpy==1.24.4
-opacus==1.1.2
-scipy==1.10.1
+pandas==2.2.3
 networkx==3.4.2
 obonet==1.1.1
-pandas==2.2.3
-matplotlib==3.9.2
+matplotlib==3.10.9
+scipy==1.10.1
 scikit-learn==1.5.2
-torch @ https://download.pytorch.org/whl/cu111/torch-1.8.1%2Bcu111-cp38-cp38-linux_x86_64.whl
-torchaudio==0.8.1
-torchvision @ https://download.pytorch.org/whl/cu111/torchvision-0.9.1%2Bcu111-cp38-cp38-linux_x86_64.whl
 tqdm==4.66.1
+Pillow==9.0.1
+pytest==6.2.5
+
+# Needed only by the old/original private-training pipeline. It is kept here so
+# legacy files can still import, but the current BINN patient-wise attack does
+# not depend on it.
+opacus==1.1.2

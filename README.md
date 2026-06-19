@@ -1,94 +1,115 @@
-# FedMIA-Repository
+# FedMIA on BINN
 
-### This is the official pytorch implementation of the paper:
+This repository contains a FedMIA membership inference evaluation for the BINN prostate-cancer model. The current main experiment is a target-client membership attack: given a candidate patient `(x, y)`, the attack estimates whether that patient was included in the target client's local training data during federated learning.
 
-- **FedMIA: An Effective Membership Inference Attack Exploiting  "All for One" Principle in Federated Learning**
-- [Paper PDF in Arxiv](https://arxiv.org/pdf/2402.06289v2)
+The implementation evaluates both FedMIA variants used in the paper:
 
+- **FedMIA-I**: loss-based measurement, implemented as negative patient loss on each client's locally trained model.
+- **FedMIA-II**: gradient-cosine measurement, comparing each client update with the candidate patient's gradient on the global model.
 
-## Description
+Both variants use non-target client measurements to estimate `Q_out`, apply the Gaussian CDF scoring step, average scores across communication rounds, and classify membership with a threshold.
 
-Federated Learning (FL) is a promising approach for training machine learning models on decentralized data while preserving privacy. However, privacy risks, particularly Membership Inference Attacks (MIAs), which aim to determine whether a specific data point belongs to a target client’s training set, remain a significant concern. Existing methods for implementing MIAs in FL primarily analyze updates from the target client, focusing on metrics such as loss, gradient norm, and gradient difference. However, these methods fail to leverage updates from non-target clients, potentially underutilizing available information.
-In this paper, we first formulate a one-tailed likelihood-ratio hypothesis test based on the likelihood of updates from non-target clients. Building upon this formulation, we introduce a three-step Membership Inference Attack (MIA) method, called FedMIA, which follows the "all for one"—leveraging updates from all clients across multiple communication rounds to enhance MIA effectiveness. Both theoretical analysis and extensive experimental results demonstrate that FedMIA outperforms existing MIAs in both classification and generative tasks. Additionally, it can be integrated as an extension to existing methods and is robust against various defense strategies, Non-IID data, and different federated structures.
+## Main Run: Patient-Wise BINN Attack
 
-![Overview of FedMIA](Overview.png)
+Use this for the final patient-level BINN evaluation:
 
+```bash
+GPU=0 bash membership_attack_binn_patient_eval.sh
+```
 
-## Getting started
+This launcher runs the paper-style BINN FedMIA experiment and additionally tracks audited patients across repeated runs. The audited patients are deliberately alternated between:
 
-### Preparation
+- **member**: present in target client 0
+- **nonmember**: absent from target client 0, either in non-target clients or in holdout depending on the configured nonmember source
 
-Before executing the project code, please prepare the Python environment according to the `requirements.txt` file. We set up the environment with `python 3.8` and `torch 1.8.1`.
+This makes patient-wise AUC, score gap, false-positive behavior, and most/least vulnerable patient reporting meaningful.
 
-In the experiment, we utilized two image classification datasets: [CIFAR-100](https://www.cs.toronto.edu/~kriz/cifar.html) and [Dermnet](www.dermnet.com). CIFAR-100 contains 50,000 images and 100 categories. Dermnet includes 23,000 dermoscopic images with 23 categories.
+Useful override example:
 
-### How to run
+```bash
+RUNS=4 CLIENT_GRID=3,5,10 ROUND_GRID=50 LOCAL_EPOCH_GRID=2 BETA_GRID=1 AUDIT_PATIENT_COUNT=64 GPU=0 bash membership_attack_binn_patient_eval.sh
+```
 
+Quick plumbing check:
 
-#### 1. Basic Training under Federated Learning:
-The basic command to run our repository is in `run.sh`. We provide two models, AlexNet and ResNet, based on the above two data sets. 
+```bash
+PLUMBING=1 bash membership_attack_binn_patient_eval.sh
+```
 
-During model training, the Membership Disclosure Measure (MDM) information, i.e., **data loss, cosine similarity and gradient norm**, is saved for subsequent attack implementation.
+## Shell Scripts
 
-#### 2. Attacks:
+| Script | Purpose |
+| --- | --- |
+| `membership_attack_binn_patient_eval.sh` | Main recommended script. Runs BINN FedMIA with audited patient tracking and patient-wise vulnerability reports. |
+| `membership_attack_binn_eval.sh` | Older compact evaluation script. Runs several fixed BINN configurations and aggregates config-level metrics, but is less focused on patient-wise reporting. |
+| `membership_attack.sh` | Lower-level configurable launcher used by both BINN wrappers. Call this directly only if you want full control over the grid parameters. |
+| `membership_attack_cifar100.sh` / `membership_attack_cifar100_eval.sh` | CIFAR-100/AlexNet reproduction scripts for the FedMIA paper-style image setting. |
 
-We conducted a comprehensive comparison of our methods, **FedMIA-I** and **FedMIA-II**, against six baseline attack methods: Blackbox-Loss[1], Grad-Cosine[2], Grad-Norm[3], Loss-Series[4], Avg-Cosine[2], and Grad-Diff[2]. FedMIA-I is utilizes the model loss measurement, while FedMIA-II employs the Grad-Cosine measurement.
+In short: use `membership_attack_binn_patient_eval.sh` for the current thesis/report experiment; use `membership_attack.sh` only when constructing a custom grid manually.
 
-The summary of these methods including the use of temporal and spatial information is shown in the below table:
+## Important Parameters
 
-|               | Measurement    | Temporal <br> Information | Spatial <br>  Information |
-| ------------- | -------------- | -------------------- | ------------------- |
-| Blackbox-Loss [1]    | Data Loss      | Single               | Single              |
-| Grad-Cosine [2]     | Cos Similarity | Single               | Single              |
-| Grad-Diff [2] | Cos similarity | Single                | Single              |
-| Grad-Norm [3] | Gradient Norm  | Single               | Single              |
-| Loss-Series [4]    | Data Loss      | Multi                | Single              |
-| Avg-Cosine  [2]   | Cos Similarity | Multi               | Single              |
-| FedMIA-I Ours | Data Loss | Multi                | Multi               |
-| FedMIA-II Ours  | Cos similarity | Multi                | Multi               |
+Most parameters can be overridden as environment variables before the shell command.
 
-These attacks are implemented in `mia_attack_auto.py` and the running command example is provided in `membership_attack.sh`. You will get a pdf format figure containing attack results after running it.
+| Parameter | Meaning |
+| --- | --- |
+| `RUNS` | Number of repeated federated trajectories per configuration. Needed for mean/std and patient-wise IN/OUT comparisons. |
+| `CLIENT_GRID` | Number of FL clients, for example `3,5,10`. |
+| `ROUND_GRID` | Number of communication rounds. |
+| `LOCAL_EPOCH_GRID` | Local epochs per client per communication round. |
+| `BETA_GRID` | Data heterogeneity setting. `iid` means approximately IID; numeric values use Dirichlet partitioning. Lower beta means stronger non-IID. |
+| `SAMPLES_PER_CLIENT_GRID` | Number of patient records per client. `auto` uses the maximum disjoint amount available for the selected client count. |
+| `AUDIT_PATIENT_COUNT` | Number of fixed patients tracked for patient-wise reporting. |
+| `NONMEMBER_SOURCE` | Which samples count as target-client nonmembers. The patient-wise script defaults to `target_nonmembers`. |
+| `THRESHOLD` | FedMIA decision threshold, usually `0.5`. |
+| `GPU` | CUDA device id exposed through `CUDA_VISIBLE_DEVICES`. |
 
+## Outputs
 
-#### 3. Defenses
+Experiment outputs are written automatically:
 
-We evaluate the robustness of FedMIA against six defense methods, including Gradient Perturbation (Perturb) [5], Gradient Sparsification (Sparse) [9,10,11], MixUp [12], Data Augmentation [7], Data Sampling [8], and a combination of Data Augmentation + Sampling.
+- `logs/`: text logs and JSONL progress logs
+- `reports/`: main TXT/CSV experiment reports and patient-wise reports
+- `aggregated_report/`: collected tables and HTML/CSV views for paper writing
+- `charts/`: generated charts from collected reports
 
+After new runs, regenerate aggregate tables with:
 
-These defenses are controlled by the parameters in `utils/args.py`.
+```bash
+python3 scripts/collect_fedmia_report_results.py
+```
 
+Regenerate charts with:
 
-### References
+```bash
+python3 scripts/make_fedmia_charts.py
+```
 
-1. Samuel Yeom, Irene Giacomelli, Matt Fredrikson, and Somesh
- Jha. Privacy risk in machine learning: Analyzing the connection to overfitting. In 2018 IEEE 31st computer security foundations symposium (CSF), 2018.
+## Tests
 
-2. Jiacheng Li, Ninghui Li, and Bruno Ribeiro. Effective passive membership inference attacks in federated learning against overparameterized models. In The Eleventh International Conference on Learning Representations, 2022.
+Run the focused patient-reporting tests with:
 
-3. Nasr, Milad, Reza Shokri, and Amir Houmansadr. Machine learning with membership privacy using adversarial regularization. Proceedings of the 2018 ACM SIGSAC conference on computer and communications security. 2018.
+```bash
+python3 -m pytest tests/test_binn_paper_grid_patient_reporting.py
+```
 
-4. Yuhao Gu, Yuebin Bai, and Shubin Xu. Cs-mia: Membership inference attack based on prediction confidence series in federated learning. Journal of Information Security and
-Applications, 2022.
+Run a syntax check for the main BINN experiment script with:
 
-5. Robin C Geyer, Tassilo Klein, and Moin Nabi. Differentially private federated learning: A client level perspective. arXiv preprint arXiv:1712.07557, 2017.
+```bash
+python3 -m py_compile experiments/fedmia_binn_paper_grid.py
+```
 
-6. Qinqing Zheng, Shuxiao Chen, Qi Long, and Weijie Su. Federated f-differential privacy. In International Conference on Artificial Intelligence and Statistics, 2021.
+## Data
 
-7. Shorten, Connor, and Taghi M. Khoshgoftaar. A survey on image data augmentation for deep learning. Journal of big data, 2019.
+The BINN experiment expects the prostate-cancer arrays under:
 
-8. Li, Anran, et al. Sample-level data selection for federated learning. IEEE INFOCOM 2021-IEEE Conference on Computer Communications. IEEE, 2021.
+```text
+data/datasets/ProstateCancer/pnet_x.npy
+data/datasets/ProstateCancer/pnet_y.npy
+```
 
-9. Otkrist Gupta and Ramesh Raskar. Distributed learning of
-deep neural network over multiple agents. Journal of Network and Computer Applications, 2018.
+The input `x` is tabular patient molecular data, and `y` is the binary class label used to compute supervised loss and gradients.
 
-10. Reza Shokri and Vitaly Shmatikov. Privacy-preserving deep learning. In Proceedings of the 22nd ACM SIGSAC conference on computer and communications security, 2015.
+## Method Summary
 
-11. Chandra Thapa, Pathum Chamikara Mahawaga Arachchige,
-Seyit Camtepe, and Lichao Sun. Splitfed: When federated
-learning meets split learning. In Proceedings of the AAAI Conference on Artificial Intelligence, 2022.
-
-12. Hongyi Zhang, Moustapha Cisse, Yann N Dauphin, and David
-Lopez-Paz. mixup: Beyond empirical risk minimization.
-arXiv preprint arXiv:1710.09412, 2017.
-
-13. Yangsibo Huang, Zhao Song, Kai Li, and Sanjeev Arora. Instahide: Instance-hiding schemes for private distributed learning. In International conference on machine learning, 2020.
+For each communication round, FedMIA computes a scalar measurement for each candidate patient and each client. FedMIA-I uses negative loss on the client-local model. FedMIA-II computes the candidate patient's gradient on the global model and compares it to each client update by cosine similarity. The non-target client measurements estimate a Gaussian `Q_out`; the target client's measurement is scored with the Gaussian CDF. Scores are averaged over communication rounds, then thresholded to infer target-client membership.

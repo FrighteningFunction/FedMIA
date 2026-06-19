@@ -1,3 +1,11 @@
+"""Build paper-friendly FedMIA result tables and an interactive HTML view.
+
+The script reads the aggregated BINN/CIFAR CSV files, keeps the columns that
+are useful for report writing, writes compact CSV/TSV table views, and creates
+an HTML page where rows/columns can be filtered before copying into Word or
+LaTeX.
+"""
+
 from __future__ import annotations
 
 import argparse

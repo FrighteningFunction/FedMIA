@@ -1,3 +1,11 @@
+"""Collect FedMIA experiment reports into reusable aggregate CSV tables.
+
+The script scans the active ``reports/`` directory, parses BINN and
+CIFAR100/AlexNet report text files, extracts configuration and metric rows
+including pooled results and patient-vulnerability summaries, and writes the
+cleaned CSV files used by the chart and table-view scripts.
+"""
+
 from __future__ import annotations
 
 import argparse

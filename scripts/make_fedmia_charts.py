@@ -1,3 +1,10 @@
+"""Generate summary charts from FedMIA experiment CSV outputs.
+
+The script reads the active report CSV files, skips patient-observation detail
+files, and creates publication/supporting-analysis plots in ``charts/`` for
+BINN and CIFAR100/AlexNet FedMIA results.
+"""
+
 from __future__ import annotations
 
 import csv
